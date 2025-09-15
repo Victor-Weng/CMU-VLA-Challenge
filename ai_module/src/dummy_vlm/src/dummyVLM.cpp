@@ -13,11 +13,15 @@
 #include <tf/transform_datatypes.h>
 #include <tf/transform_broadcaster.h>
 
+#include <algorithm> // transform
+#include <cctype>    // to lower
+#include <sstream>   // space separated numbers
+
 using namespace std;
 
 string waypoint_file_dir;
 string object_list_file_dir;
-double waypointReachDis = 1.0;
+double waypointReachDis = 1.0; // how far from waypont is considered "reached"
 
 vector<float> waypointX, waypointY, waypointHeading;
 
@@ -28,6 +32,18 @@ string objLabel;
 float vehicleX = 0, vehicleY = 0;
 
 string question;
+
+// global cancel flag for stopping ongoing navigation
+volatile bool g_cancelNav = false;
+
+// forward declarations
+
+bool handleNavCommand(const std::string &q,                // raw question text
+                      ros::Publisher &waypointPub,         // publisher for /way_point_with_heading
+                      geometry_msgs::Pose2D &waypointMsgs, // reusable message object
+                      ros::Rate &rate);
+
+void pubPathWaypoints(ros::Publisher &waypointPub, geometry_msgs::Pose2D &waypointMsgs, ros::Rate &rate);
 
 // reading waypoints from file function
 void readWaypointFile()
@@ -129,8 +145,159 @@ void readObjectListFile()
     objLabel += s[i];
 }
 
+// handle navigator commands (to be replaced by LLM later)
+// Parse and execute simple nav commands
+//   1) "goto x y [theta]"  -> publish a single waypoint to (x, y) with optional theta
+//   2) "explore [radius] [N]" -> generate N waypoints on a circle around the current pose
+// return true : handled false : not
+bool handleNavCommand(const std::string &q, ros::Publisher &waypointPub, geometry_msgs::Pose2D &waypointMsgs, ros::Rate &rate)
+{
+  // trim leading spaces
+  size_t start = q.find_first_not_of(" \t\r\n");
+  if (start == std::string::npos)
+  { // all empty or whitespace
+    return false;
+  }
+
+  // trimmed q
+  std::string s = q.substr(start);
+
+  // lower case for handling goto / explore
+  std::string lower = s;
+  // transform over the start and end of the string and output at the start, (change in place). apply ::tolower to each char
+  std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+
+  // COMMAND 1: GOTO
+
+  // STOP: cancel any ongoing navigation promptly
+  if (lower.rfind("stop", 0) == 0)
+  {
+    g_cancelNav = true;
+    ROS_WARN("Stop command received; canceling navigation.");
+    return true;
+  }
+
+  if (lower.rfind("goto", 0) == 0)
+  { /// starts with goto
+    // Use an input string stream to parse numbers after the command word.
+    std::istringstream iss(s);
+
+    std::string cmd; // will hold "goto"
+    float x = 0.0f;  // target x
+    float y = 0.0f;  // target y
+    float th = 0.0f; // optional heading (theta), default 0
+
+    // Parse: first token (cmd), then x and y
+    // iss: is string stream
+    iss >> cmd >> x >> y;
+
+    // show proper form if not form
+    if (iss.fail())
+    {
+      ROS_WARN("Usage: goto <x> <y> [theta]");
+      return true;
+    }
+
+    // parse for 0 but if not available then default to 0 rad
+    iss >> th;
+    if (iss.fail())
+    {
+      th = 0.0f;
+    }
+
+    // Log for visibility.
+    ROS_INFO("Goto command: (x=%.2f, y=%.2f, theta=%.2f)", x, y, th);
+
+    // Use pubPathWaypoints with a single temporary waypoint, preserving existing path
+    const auto oldX = waypointX;
+    const auto oldY = waypointY;
+    const auto oldH = waypointHeading;
+
+    waypointX.clear();
+    waypointY.clear();
+    waypointHeading.clear();
+    waypointX.push_back(x);
+    waypointY.push_back(y);
+    waypointHeading.push_back(th);
+
+    pubPathWaypoints(waypointPub, waypointMsgs, rate);
+
+    waypointX = oldX;
+    waypointY = oldY;
+    waypointHeading = oldH;
+    return true;
+  }
+
+  // COMMAND 2: EXPLORE for radius (default 2) and number of points on the circle (default 8)
+  // Sequentially generates then publishes waypoints in the circle formation
+  if (lower.rfind("explore", 0) == 0)
+  {
+    // parse paramters after explore
+    std::istringstream iss(s);
+
+    std::string cmd;     // holds "explore"
+    float radius = 2.0f; // rad
+    int N = 8;
+
+    // read format:
+    iss >> cmd >> radius >> N;
+    if (iss.fail())
+    {
+      // reset defaults
+      float radius = 2.0f; // rad
+      int N = 8;
+    }
+
+    // check params are positive
+    if (radius <= 0.0f)
+      radius = 2.0f;
+    if (N <= 0)
+      N = 8;
+
+    // log
+    ROS_INFO("Explore command: center=(%.2f, %.2f), radius=%.2f, N=%d", vehicleX, vehicleY, radius, N);
+
+    // Build a temporary ring of waypoints and run pubPathWaypoints
+    const auto oldX = waypointX;
+    const auto oldY = waypointY;
+    const auto oldH = waypointHeading;
+
+    waypointX.clear();
+    waypointY.clear();
+    waypointHeading.clear();
+
+    for (int i = 0; i < N && ros::ok(); ++i)
+    {
+      float ang = 2.0f * static_cast<float>(M_PI) * (static_cast<float>(i) / static_cast<float>(N));
+      float wx = vehicleX + radius * cos(ang);
+      float wy = vehicleY + radius * sin(ang);
+      float wth = ang;
+      waypointX.push_back(wx);
+      waypointY.push_back(wy);
+      waypointHeading.push_back(wth);
+    }
+
+    pubPathWaypoints(waypointPub, waypointMsgs, rate);
+
+    waypointX = oldX;
+    waypointY = oldY;
+    waypointHeading = oldH;
+    return true;
+  }
+
+  if(lower.)
+
+  std::cout << "Nothing read";
+  return false;
+}
+
+// publishing helpers:
+
 void pubPathWaypoints(ros::Publisher &waypointPub, geometry_msgs::Pose2D &waypointMsgs, ros::Rate &rate)
 {
+  // Timeout safeguard per waypoint (seconds) to prevent indefinite waiting
+  const double waypointTimeoutSec = 30.0;
+
   int waypointID = 0;
   int waypointNum = waypointX.size();
 
@@ -144,11 +311,23 @@ void pubPathWaypoints(ros::Publisher &waypointPub, geometry_msgs::Pose2D &waypoi
   waypointMsgs.x = waypointX[waypointID];
   waypointMsgs.y = waypointY[waypointID];
   waypointMsgs.theta = waypointHeading[waypointID];
+  if (waypointPub.getNumSubscribers() == 0)
+    ROS_WARN("No subscribers on /way_point_with_heading (planner not running?)");
   waypointPub.publish(waypointMsgs);
+
+  // Start timer for timeout handling
+  ros::Time wpStart = ros::Time::now();
 
   bool status = ros::ok();
   while (status)
   {
+    if (g_cancelNav)
+    {
+      ROS_WARN("Navigation canceled by STOP command.");
+      g_cancelNav = false;
+      break;
+    }
+
     ros::spinOnce();
 
     float disX = vehicleX - waypointX[waypointID];
@@ -158,13 +337,28 @@ void pubPathWaypoints(ros::Publisher &waypointPub, geometry_msgs::Pose2D &waypoi
     if (sqrt(disX * disX + disY * disY) < waypointReachDis)
     {
       if (waypointID == waypointNum - 1)
-        break;
+        break; // break out at least waypoint
       waypointID++;
 
       waypointMsgs.x = waypointX[waypointID];
       waypointMsgs.y = waypointY[waypointID];
       waypointMsgs.theta = waypointHeading[waypointID];
       waypointPub.publish(waypointMsgs);
+      wpStart = ros::Time::now(); // reset timeout timer on advance
+    }
+
+    // If planner rejected goal or cannot reach, avoid hanging forever
+    if ((ros::Time::now() - wpStart).toSec() > waypointTimeoutSec)
+    {
+      ROS_WARN("Timeout waiting to reach waypoint %d/%d; skipping", waypointID + 1, waypointNum);
+      if (waypointID == waypointNum - 1)
+        break;
+      waypointID++;
+      waypointMsgs.x = waypointX[waypointID];
+      waypointMsgs.y = waypointY[waypointID];
+      waypointMsgs.theta = waypointHeading[waypointID];
+      waypointPub.publish(waypointMsgs);
+      wpStart = ros::Time::now();
     }
 
     status = ros::ok();
@@ -224,6 +418,7 @@ void poseHandler(const nav_msgs::Odometry::ConstPtr &pose)
 {
   vehicleX = pose->pose.pose.position.x;
   vehicleY = pose->pose.pose.position.y;
+  ROS_INFO_THROTTLE(1.0, "Odom x=%.2f y=%.2f", vehicleX, vehicleY);
 }
 
 void questionHandler(const std_msgs::String::ConstPtr &msg)
@@ -285,8 +480,13 @@ int main(int argc, char **argv)
       delObjectMarker(objectMarkerPub, objectMarkerMsgs);
       int32_t number = (rand() % 10) + 1;
       printf("[dummyVLM] Received 'How many' question: %s\n", question.c_str());
-      ROS_INFO(to_string(number).c_str());
+      ROS_INFO("%d", number);
       pubNumericalAnswer(numericalAnswerPub, numericalResponseMsg, number);
+    }
+    // custom navigation
+    else if (handleNavCommand(question, waypointPub, waypointMsgs, rate))
+    {
+      ROS_INFO("Navigation command handled.");
     }
     else
     {
