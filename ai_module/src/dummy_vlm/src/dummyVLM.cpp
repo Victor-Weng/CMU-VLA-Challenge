@@ -5,6 +5,7 @@
 #include <ros/ros.h>
 
 #include <nav_msgs/Odometry.h>
+#include <nav_msgs/OccupancyGrid.h>
 #include <geometry_msgs/Pose2D.h>
 #include <visualization_msgs/Marker.h>
 #include <std_msgs/String.h>
@@ -36,6 +37,10 @@ string question;
 // global cancel flag for stopping ongoing navigation
 volatile bool g_cancelNav = false;
 
+// latest occupancy grid
+nav_msgs::OccupancyGrid g_map;
+bool g_hasMap = false;
+
 // forward declarations
 
 bool handleNavCommand(const std::string &q,                // raw question text
@@ -44,6 +49,14 @@ bool handleNavCommand(const std::string &q,                // raw question text
                       ros::Rate &rate);
 
 void pubPathWaypoints(ros::Publisher &waypointPub, geometry_msgs::Pose2D &waypointMsgs, ros::Rate &rate);
+
+// frontier-based target selection
+bool findBestFrontierTarget(const nav_msgs::OccupancyGrid &map,
+                            float rx, float ry,
+                            float &tx, float &ty, float &th);
+
+// /map callback
+void mapHandler(const nav_msgs::OccupancyGrid::ConstPtr &msg);
 
 // reading waypoints from file function
 void readWaypointFile()
@@ -179,6 +192,8 @@ bool handleNavCommand(const std::string &q, ros::Publisher &waypointPub, geometr
 
   if (lower.rfind("goto", 0) == 0)
   { /// starts with goto
+    // starting a new navigation; ensure cancel flag is cleared
+    g_cancelNav = false;
     // Use an input string stream to parse numbers after the command word.
     std::istringstream iss(s);
 
@@ -232,6 +247,8 @@ bool handleNavCommand(const std::string &q, ros::Publisher &waypointPub, geometr
   // Sequentially generates then publishes waypoints in the circle formation
   if (lower.rfind("explore", 0) == 0)
   {
+    // starting a new navigation; ensure cancel flag is cleared
+    g_cancelNav = false;
     // parse paramters after explore
     std::istringstream iss(s);
 
@@ -243,9 +260,8 @@ bool handleNavCommand(const std::string &q, ros::Publisher &waypointPub, geometr
     iss >> cmd >> radius >> N;
     if (iss.fail())
     {
-      // reset defaults
-      float radius = 2.0f; // rad
-      int N = 8;
+      // keep defaults
+      iss.clear();
     }
 
     // check params are positive
@@ -285,7 +301,54 @@ bool handleNavCommand(const std::string &q, ros::Publisher &waypointPub, geometr
     return true;
   }
 
-  if(lower.)
+  // COMMAND 3: FRONTIER exploration (auto-explore via occupancy grid)
+  if (lower.rfind("frontier", 0) == 0 || lower.rfind("autoexplore", 0) == 0)
+  {
+    // starting a new navigation; ensure cancel flag is cleared
+    g_cancelNav = false;
+    std::istringstream iss(s);
+    std::string cmd;
+    int maxSteps = 10; // default hops
+    iss >> cmd >> maxSteps;
+    if (maxSteps <= 0)
+      maxSteps = 10;
+
+    if (!g_hasMap)
+    {
+      ROS_WARN("No /map received yet; cannot run frontier exploration.");
+      return true;
+    }
+
+    ROS_INFO("Frontier exploration: maxSteps=%d", maxSteps);
+    for (int step = 0; step < maxSteps && ros::ok() && !g_cancelNav; ++step)
+    {
+      float tx, ty, th;
+      if (!findBestFrontierTarget(g_map, vehicleX, vehicleY, tx, ty, th))
+      {
+        ROS_INFO("No valid frontier found; exploration complete.");
+        break;
+      }
+
+      const auto oldX = waypointX;
+      const auto oldY = waypointY;
+      const auto oldH = waypointHeading;
+      waypointX.clear();
+      waypointY.clear();
+      waypointHeading.clear();
+      waypointX.push_back(tx);
+      waypointY.push_back(ty);
+      waypointHeading.push_back(th);
+      ROS_INFO("Frontier step %d: target (%.2f, %.2f) th=%.2f", step + 1, tx, ty, th);
+      pubPathWaypoints(waypointPub, waypointMsgs, rate);
+      waypointX = oldX;
+      waypointY = oldY;
+      waypointHeading = oldH;
+
+      ros::spinOnce();
+      rate.sleep();
+    }
+    return true;
+  }
 
   std::cout << "Nothing read";
   return false;
@@ -427,6 +490,13 @@ void questionHandler(const std_msgs::String::ConstPtr &msg)
   question = msg->data;
 }
 
+// /map callback: store latest occupancy grid
+void mapHandler(const nav_msgs::OccupancyGrid::ConstPtr &msg)
+{
+  g_map = *msg;
+  g_hasMap = true;
+}
+
 int main(int argc, char **argv)
 {
   ros::init(argc, argv, "dummyVLM");
@@ -440,6 +510,7 @@ int main(int argc, char **argv)
   ros::Subscriber subPose = nh.subscribe<nav_msgs::Odometry>("/state_estimation", 5, poseHandler);
 
   ros::Subscriber subQuestion = nh.subscribe<std_msgs::String>("/challenge_question", 5, questionHandler);
+  ros::Subscriber subMap = nh.subscribe<nav_msgs::OccupancyGrid>("/map", 1, mapHandler);
 
   ros::Publisher waypointPub = nh.advertise<geometry_msgs::Pose2D>("/way_point_with_heading", 5);
   geometry_msgs::Pose2D waypointMsgs;
@@ -501,4 +572,112 @@ int main(int argc, char **argv)
   }
 
   return 0;
+}
+
+// --- Frontier selection ---
+static inline bool worldToMap(float wx, float wy, const nav_msgs::OccupancyGrid &map, int &mx, int &my)
+{
+  const float res = map.info.resolution;
+  const float ox = map.info.origin.position.x;
+  const float oy = map.info.origin.position.y;
+  mx = static_cast<int>(floor((wx - ox) / res));
+  my = static_cast<int>(floor((wy - oy) / res));
+  return (mx >= 0 && my >= 0 && mx < static_cast<int>(map.info.width) && my < static_cast<int>(map.info.height));
+}
+
+static inline void mapToWorld(int mx, int my, const nav_msgs::OccupancyGrid &map, float &wx, float &wy)
+{
+  const float res = map.info.resolution;
+  const float ox = map.info.origin.position.x;
+  const float oy = map.info.origin.position.y;
+  wx = ox + (mx + 0.5f) * res;
+  wy = oy + (my + 0.5f) * res;
+}
+
+static inline int idxOf(int x, int y, int width) { return y * width + x; }
+
+bool findBestFrontierTarget(const nav_msgs::OccupancyGrid &map,
+                            float rx, float ry,
+                            float &tx, float &ty, float &th)
+{
+  const int W = static_cast<int>(map.info.width);
+  const int H = static_cast<int>(map.info.height);
+  if (W <= 2 || H <= 2 || map.data.empty())
+    return false;
+
+  int rmx = 0, rmy = 0;
+  if (!worldToMap(rx, ry, map, rmx, rmy))
+  {
+    rmx = W / 2;
+    rmy = H / 2;
+  }
+
+  const auto &data = map.data;
+  const int stride = 2;      // subsample for speed
+  const int occThresh = 50;  // >=50 -> occupied
+  const int clearVal = 0;    // 0 -> free
+  const int unknownVal = -1; // -1 -> unknown
+  const int clearance = 2;   // cells to avoid around obstacles
+  const int infoRadius = 4;  // radius for information gain
+
+  double bestScore = -1.0;
+  int bestX = -1, bestY = -1;
+
+  auto isOcc = [&](int x, int y)
+  { return data[idxOf(x, y, W)] >= occThresh; };
+  auto isFree = [&](int x, int y)
+  { return data[idxOf(x, y, W)] == clearVal; };
+  auto isUnknown = [&](int x, int y)
+  { return data[idxOf(x, y, W)] == unknownVal; };
+
+  for (int y = 1; y < H - 1; y += stride)
+  {
+    for (int x = 1; x < W - 1; x += stride)
+    {
+      if (!isFree(x, y))
+        continue;
+      if (!(isUnknown(x + 1, y) || isUnknown(x - 1, y) || isUnknown(x, y + 1) || isUnknown(x, y - 1)))
+        continue; // not a frontier
+
+      bool nearOcc = false;
+      for (int dy = -clearance; dy <= clearance && !nearOcc; ++dy)
+        for (int dx = -clearance; dx <= clearance && !nearOcc; ++dx)
+        {
+          int nx = x + dx, ny = y + dy;
+          if (nx < 0 || nx >= W || ny < 0 || ny >= H)
+            continue;
+          nearOcc = nearOcc || isOcc(nx, ny);
+        }
+      if (nearOcc)
+        continue;
+
+      int info = 0;
+      for (int dy = -infoRadius; dy <= infoRadius; ++dy)
+        for (int dx = -infoRadius; dx <= infoRadius; ++dx)
+        {
+          int nx = x + dx, ny = y + dy;
+          if (nx < 0 || nx >= W || ny < 0 || ny >= H)
+            continue;
+          if (isUnknown(nx, ny))
+            ++info;
+        }
+
+      double dist = hypot(static_cast<double>(x - rmx), static_cast<double>(y - rmy));
+      if (dist < 1.0)
+        dist = 1.0;
+      double score = static_cast<double>(info) / dist;
+      if (score > bestScore)
+      {
+        bestScore = score;
+        bestX = x;
+        bestY = y;
+      }
+    }
+  }
+
+  if (bestScore <= 0.0 || bestX < 0)
+    return false;
+  mapToWorld(bestX, bestY, map, tx, ty);
+  th = atan2f(ty - ry, tx - rx);
+  return true;
 }
