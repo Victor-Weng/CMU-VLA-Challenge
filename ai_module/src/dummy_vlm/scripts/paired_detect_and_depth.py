@@ -100,6 +100,10 @@ class PairedDetectAndDepth:
         # "specific" command interface
         self.specific_enabled = bool(rospy.get_param('~specific_enabled', True))
         self.specific_cmd_topic = rospy.get_param('~specific_cmd_topic', '/vlm_command')
+        # Gating: wait for a question before any processing
+        self.wait_for_question = bool(rospy.get_param('~wait_for_question', True))
+        self.question_topic = rospy.get_param('~question_topic', '/challenge_question')
+        self.activated = not self.wait_for_question
         # Deduplication settings
         self.dedup_enabled = bool(rospy.get_param('~dedup_enabled', True))
         self.dedup_radius_m = float(rospy.get_param('~dedup_radius_m', 0.5))
@@ -161,6 +165,10 @@ class PairedDetectAndDepth:
         self.last_image_path = ''    # last saved image path
         if self.specific_enabled:
             self.spec_sub = rospy.Subscriber(self.specific_cmd_topic, String, self._on_specific_cmd, queue_size=5)
+        # Activate on the first question
+        if self.wait_for_question:
+            self.q_sub = rospy.Subscriber(self.question_topic, String, self._on_question, queue_size=5)
+            rospy.loginfo('paired_detect_and_depth: waiting for first question on %s before activating', self.question_topic)
 
         # Optional cleanup and initialize sequence counter
         if self.cleanup_images_on_startup and self.sequential_saves:
@@ -247,6 +255,9 @@ class PairedDetectAndDepth:
                 pass
 
     def on_pair(self, img_msg: Image, pc_msg: PointCloud2):
+        if not self.activated:
+            rospy.loginfo_throttle(10.0, 'paired_detect_and_depth: idle (waiting for question on %s)', self.question_topic)
+            return
         stamp = img_msg.header.stamp
         img_frame = img_msg.header.frame_id or 'camera'
         pc_frame = pc_msg.header.frame_id or 'map'
@@ -466,6 +477,11 @@ class PairedDetectAndDepth:
                     rospy.loginfo('paired_detect_and_depth: wrote specific outputs: %s', ', '.join(outs))
             except Exception as e:
                 rospy.logwarn('paired_detect_and_depth: specific render failed: %s', str(e))
+
+    def _on_question(self, msg: String):
+        if not self.activated:
+            self.activated = True
+            rospy.loginfo('paired_detect_and_depth: activated by question: "%s"', (msg.data or '')[:80])
 
     # ---------- Helpers for sequential saving ----------
     def _init_seq_counter(self):

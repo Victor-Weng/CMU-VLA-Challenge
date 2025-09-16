@@ -118,6 +118,7 @@ static ros::Time g_goHomeStepDeadline;     // current step deadline
 
 // Track whether we've run frontier at least once in this session
 static bool g_frontierWasRun = false;
+static double g_frontierWarmupSec = 20.0; // default warmup duration before answering
 
 // Helper: record (and de-dup) waypoint events
 static inline void recordWaypoint(const geometry_msgs::Pose2D &wp)
@@ -938,6 +939,7 @@ int main(int argc, char **argv)
   nhPrivate.param("home_push_dist", g_homePushDist, g_homePushDist);
   nhPrivate.param("home_go_timeout_sec", g_homeGoTimeoutSec, g_homeGoTimeoutSec);
   nhPrivate.param("home_push_timeout_sec", g_homePushTimeoutSec, g_homePushTimeoutSec);
+  nhPrivate.param("frontier_warmup_sec", g_frontierWarmupSec, g_frontierWarmupSec);
 
   ros::Subscriber subPose = nh.subscribe<nav_msgs::Odometry>("/state_estimation", 5, poseHandler);
 
@@ -955,6 +957,9 @@ int main(int argc, char **argv)
 
   ros::Publisher numericalAnswerPub = nh.advertise<std_msgs::Int32>("/numerical_response", 5);
   std_msgs::Int32 numericalResponseMsg;
+
+  // Publish raw LLM (Mistral) responses for visibility
+  ros::Publisher mistralResponsePub = nh.advertise<std_msgs::String>("/mistral_response", 5);
 
   // local alias for publishing waypoints inside this function
   ros::Publisher &waypointPub = g_waypointPub;
@@ -989,10 +994,10 @@ int main(int argc, char **argv)
     // We have a question; ensure frontier has run before answering
     if (!g_frontierWasRun)
     {
-      ROS_INFO("Frontier has not been run yet; running for 5 minutes before answering.");
+      ROS_INFO("Frontier has not been run yet; running for %.0f seconds before answering.", g_frontierWarmupSec);
       g_frontierEnabled = true;
       ros::Time start = ros::Time::now();
-      ros::Duration horizon(300.0); // 5 minutes
+      ros::Duration horizon(g_frontierWarmupSec);
       while (ros::ok() && (ros::Time::now() - start) < horizon)
       {
         ros::spinOnce();
@@ -1003,15 +1008,25 @@ int main(int argc, char **argv)
       ROS_INFO("Frontier run complete; proceeding to answer.");
     }
 
-    // Call Mistral with the question text
+    // Call Mistral with the question text (log timing and publish raw output)
+    ROS_INFO("Calling Mistral for question (%zu chars)...", question.size());
+    ros::Time t0 = ros::Time::now();
     std::string mistralOut = askMistral(question);
+    double dt = (ros::Time::now() - t0).toSec();
     if (!mistralOut.empty())
     {
+      ROS_INFO("Mistral responded in %.2fs (%zu chars)", dt, mistralOut.size());
       ROS_INFO("Mistral says: %s", mistralOut.c_str());
     }
     else
     {
-      ROS_WARN("Mistral returned empty response.");
+      ROS_WARN("Mistral returned empty response in %.2fs", dt);
+    }
+    // Publish raw response to a topic for external verification/logging
+    {
+      std_msgs::String outMsg;
+      outMsg.data = mistralOut;
+      mistralResponsePub.publish(outMsg);
     }
 
     // Very simple trigger-based action routing

@@ -6,6 +6,7 @@ import errno
 
 import rospy
 from sensor_msgs.msg import Image
+from std_msgs.msg import String
 try:
     from cv_bridge import CvBridge, CvBridgeError
 except Exception:
@@ -52,6 +53,10 @@ class CameraSaveAndDetect:
         self.model = rospy.get_param('~model', 'yolov8n.pt')
         self.save_path_param = rospy.get_param('~save_path', '')  # if provided, overrides default path
         self.extra_compat_writes = bool(rospy.get_param('~extra_compat_writes', True))
+        # Gating: wait for a question before doing anything
+        self.wait_for_question = bool(rospy.get_param('~wait_for_question', True))
+        self.question_topic = rospy.get_param('~question_topic', '/challenge_question')
+        self.activated = not self.wait_for_question
         # New: sequential saving and cleanup
         self.sequential_saves = bool(rospy.get_param('~sequential_saves', True))
         self.image_dir_param = rospy.get_param('~image_dir', '')
@@ -102,6 +107,10 @@ class CameraSaveAndDetect:
         # Initialize sequential counter
         self._init_seq_counter()
 
+        # Optional question subscriber to activate on first question
+        if self.wait_for_question:
+            self.q_sub = rospy.Subscriber(self.question_topic, String, self._on_question, queue_size=5)
+            rospy.loginfo('camera_save_and_detect: waiting for first question on %s before activating', self.question_topic)
         self.sub = rospy.Subscriber(self.image_topic, Image, self.image_cb, queue_size=1, buff_size=2**24)
         rospy.loginfo('camera_save_and_detect: listening to %s', self.image_topic)
         rospy.loginfo('camera_save_and_detect: interval = %.2fs, model = %s', self.interval_sec, self.model)
@@ -113,6 +122,9 @@ class CameraSaveAndDetect:
             rospy.loginfo('camera_save_and_detect: compat save paths = %s, %s', self.alt_save_path, self.alt2_save_path)
 
     def image_cb(self, msg: Image):
+        if not self.activated:
+            rospy.loginfo_throttle(10.0, 'camera_save_and_detect: idle (waiting for question on %s)', self.question_topic)
+            return
         now = msg.header.stamp if msg.header.stamp and msg.header.stamp.to_sec() > 0 else rospy.Time.now()
         self.last_rx_time = now
         # Basic frame info for debugging
@@ -243,6 +255,11 @@ class CameraSaveAndDetect:
                     os.remove(os.path.join(self.image_dir, name))
                 except Exception:
                     pass
+
+    def _on_question(self, msg: String):
+        if not self.activated:
+            self.activated = True
+            rospy.loginfo('camera_save_and_detect: activated by question: "%s"', (msg.data or '')[:80])
 
 
 def main():
