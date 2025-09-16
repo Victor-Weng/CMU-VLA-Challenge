@@ -15,6 +15,7 @@
 #include <visualization_msgs/Marker.h>
 #include <std_msgs/String.h>
 #include <std_msgs/Int32.h>
+#include <std_srvs/Trigger.h>
 
 #include <tf/transform_datatypes.h>
 #include <tf/transform_broadcaster.h>
@@ -148,7 +149,10 @@ static ros::Time g_goHomeStepDeadline;     // current step deadline
 static bool g_frontierWasRun = false;
 static double g_frontierWarmupSec = 20.0; // default warmup duration before answering
 static bool g_shutdownAfterAnswer = true; // stop node after answering by default
-static bool g_hasObjectInfo = false;      // whether structured object info was loaded
+// Clear detection log at first question if frontier has not run yet
+static bool g_clearDetectOnFreshSession = true;
+static std::string g_detectClearService = "/paired_detect_and_depth/clear_object_list";
+static bool g_hasObjectInfo = false; // whether structured object info was loaded
 
 // Helper: record (and de-dup) waypoint events
 static inline void recordWaypoint(const geometry_msgs::Pose2D &wp)
@@ -991,6 +995,8 @@ int main(int argc, char **argv)
   nhPrivate.param("home_push_timeout_sec", g_homePushTimeoutSec, g_homePushTimeoutSec);
   nhPrivate.param("frontier_warmup_sec", g_frontierWarmupSec, g_frontierWarmupSec);
   nhPrivate.param("shutdown_after_answer", g_shutdownAfterAnswer, g_shutdownAfterAnswer);
+  nhPrivate.param("clear_detect_on_fresh_session", g_clearDetectOnFreshSession, g_clearDetectOnFreshSession);
+  nhPrivate.param("detect_clear_service", g_detectClearService, g_detectClearService);
 
   ros::Subscriber subPose = nh.subscribe<nav_msgs::Odometry>("/state_estimation", 5, poseHandler);
 
@@ -1047,6 +1053,28 @@ int main(int argc, char **argv)
     // We have a question; ensure frontier has run before answering
     if (!g_frontierWasRun)
     {
+      // Optionally clear detection log before starting a fresh frontier session
+      if (g_clearDetectOnFreshSession)
+      {
+        ROS_INFO("Clearing detection log via service %s before fresh frontier run", g_detectClearService.c_str());
+        bool svcOk = ros::service::waitForService(g_detectClearService, ros::Duration(3.0));
+        if (svcOk)
+        {
+          std_srvs::Trigger srv;
+          if (ros::service::call(g_detectClearService, srv))
+          {
+            ROS_INFO("Detection log cleared: %s", srv.response.message.c_str());
+          }
+          else
+          {
+            ROS_WARN("Detection log clear service call failed");
+          }
+        }
+        else
+        {
+          ROS_WARN("Detection log clear service %s not available; proceeding without clear", g_detectClearService.c_str());
+        }
+      }
       ROS_INFO("Frontier has not been run yet; running for %.0f seconds before answering.", g_frontierWarmupSec);
       g_frontierEnabled = true;
       ros::Time start = ros::Time::now();

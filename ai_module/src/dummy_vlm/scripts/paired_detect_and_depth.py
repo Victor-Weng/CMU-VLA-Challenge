@@ -509,17 +509,18 @@ class PairedDetectAndDepth:
         if self.dedup_enabled:
             px = self.pose_x if not math.isnan(self.pose_x) else None
             py = self.pose_y if not math.isnan(self.pose_y) else None
-            if px is not None and py is not None:
-                before = len(results)
-                results = self._dedup_filter(results, px, py)
-                removed = before - len(results)
-                if removed > 0:
-                    rospy.loginfo('paired_detect_and_depth: dedup removed %d duplicate(s) (pose<=%.2fm, pix<=~%.0f, d<=%.2fm)',
-                                  removed, self.dedup_radius_m, self.dedup_pixel_radius, self.dedup_dist_tol_m)
-
-        # Append to object_list.txt (now includes robot x, y and image file name)
-        try:
-            with open(self.object_list_path, 'a') as f:
+            before = len(results)
+            results = self._dedup_filter(results, px, py)
+            removed = before - len(results)
+            if removed > 0:
+                rospy.loginfo('paired_detect_and_depth: dedup removed %d duplicate(s) (pix-strict<=%.1f, pose<=%.2fm, pix<=~%.0f, d<=%.2fm)',
+                              removed,
+                              float(rospy.get_param('~dedup_pixel_strict_radius', 6.0)),
+                              self.dedup_radius_m,
+                              self.dedup_pixel_radius,
+                              self.dedup_dist_tol_m)
+            else:
+                rospy.logdebug('paired_detect_and_depth: dedup kept all %d detections', len(results))
                 img_name = os.path.basename(out_path)
                 for (label, u, v, dist) in results:
                     px = self.pose_x if not math.isnan(self.pose_x) else -1
@@ -537,8 +538,6 @@ class PairedDetectAndDepth:
                 f.flush()
                 os.fsync(f.fileno())
             rospy.loginfo('paired_detect_and_depth: wrote %d detections to %s (pose x=%.3f y=%.3f, img=%s)', len(results), self.object_list_path, self.pose_x, self.pose_y, os.path.basename(out_path))
-        except Exception as e:
-            rospy.logwarn('Failed writing object list: %s', str(e))
         # If we have a pending "specific" request, render and save filtered boxes now
         if self._pending_specific and self.last_image_path:
             try:
@@ -665,7 +664,7 @@ class PairedDetectAndDepth:
             parts = ln.strip().split('\t')
             if len(parts) < 5:
                 continue
-            label = parts[1]
+            label = (parts[1] or '').strip().lower()
             try:
                 u0 = float(parts[2]); v0 = float(parts[3]); d0 = float(parts[4])
             except Exception:
@@ -677,16 +676,24 @@ class PairedDetectAndDepth:
                     pxx = float(parts[5]); pyy = float(parts[6])
                 except Exception:
                     pxx = None; pyy = None
-            if pxx is None or pyy is None:
-                # Skip entries without pose; not enough info for spatial dedup
-                continue
+            # Keep entries even without pose so we can at least use pixel-based dedup
             by_label.setdefault(label, []).append((u0, v0, d0, pxx, pyy))
 
+        # Strict pixel-only radius: if two same-label detections land within this many pixels,
+        # treat them as the same object regardless of pose/depth differences.
+        strict_pix_r = float(rospy.get_param('~dedup_pixel_strict_radius', 6.0))
+
         def is_dup(label, u, v, d, x, y):
-            hist = by_label.get(label)
+            key = (label or '').strip().lower()
+            hist = by_label.get(key)
             if not hist:
                 return False
             for (u0, v0, d0, x0, y0) in hist:
+                pix_dist = math.hypot(u - u0, v - v0)
+                # Strict pixel-based duplicate (ignores pose/depth)
+                if pix_dist <= strict_pix_r:
+                    return True
+
                 # Adaptive pixel radius: widen when objects are near (smaller depth)
                 if (d is not None and d0 is not None and d > 0 and d0 > 0 and
                         not math.isnan(d) and not math.isnan(d0)):
@@ -694,18 +701,24 @@ class PairedDetectAndDepth:
                 else:
                     eff_rad = self.dedup_pixel_fallback
 
-                pix_close = (math.hypot(u - u0, v - v0) <= eff_rad)
-                pose_close = (math.hypot(x - x0, y - y0) <= self.dedup_radius_m)
+                pix_close = (pix_dist <= eff_rad)
 
-                # If depth unknown, rely on pixel and pose proximity only
-                if (d is None or d0 is None or d <= 0 or d0 <= 0 or math.isnan(d) or math.isnan(d0)):
-                    if pix_close and pose_close:
-                        return True
+                # If we have pose for the historical entry, consider pose proximity; otherwise rely on pixels
+                pose_close = (x0 is not None and y0 is not None and x is not None and y is not None and
+                              math.hypot(x - x0, y - y0) <= self.dedup_radius_m)
+
+                if not pix_close:
                     continue
 
-                # When depth known, also require similar distances
-                if pix_close and pose_close and abs(d - d0) <= self.dedup_dist_tol_m:
+                # If depth unknown, pixel-close is enough (with or without pose)
+                if (d is None or d0 is None or d <= 0 or d0 <= 0 or math.isnan(d) or math.isnan(d0)):
                     return True
+
+                # When depth known, be lenient: if pixel-close and (pose_close or very pixel-close), accept
+                if pix_close and (pose_close or pix_dist <= strict_pix_r * 2.0):
+                    # Optionally keep a depth tolerance; but loosen it by default
+                    if abs(d - d0) <= max(self.dedup_dist_tol_m, 1.0):
+                        return True
             return False
 
         filtered = []
