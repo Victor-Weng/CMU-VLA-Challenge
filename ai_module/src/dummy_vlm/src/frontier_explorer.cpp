@@ -3,12 +3,14 @@
 #include <geometry_msgs/PoseStamped.h> // to publish next goal (pos + header)
 #include <geometry_msgs/Point.h>       // store cell coordinates in frontier structs
 #include <tf/transform_listener.h>     // TF Listener to query the robot pose
+#include <nav_msgs/Odometry.h>         // optional odom fallback for robot pose
 // Include standard headers for utilities (vectors, queues, limits).
 #include <vector>
 #include <queue>
 #include <limits>
 #include <cmath>
 #include <string>
+#include <algorithm>
 
 using std::queue;
 using std::size_t;
@@ -42,28 +44,46 @@ public: // accessible outside the class
     // constructor: set up ROS interfaces and parameters
     FrontierExplorer(ros::NodeHandle &nh, ros::NodeHandle &pnh)
         : nh_(nh), pnh_(pnh),
-          tf_listener_(),            // transform frames from camera and lidar to our map
-          have_map_(false),          // no map by default
-          map_frame_("map"),         // default map frame name
-          robot_frame_("base_link"), // default robot frame name
-          free_threshold_(20),       // occupancy <= 20 = free, change this later
-          occ_threshold_(65),        // >= 65 = occupied
-          min_frontier_cells_(10),   // minimum cluster size to consider a valid frontier
-          goal_topic_("/next_goal"), // topic to publish PoseStamped goals
-          map_topic_("/map")         // topic to subscribe for occupany grid
+          tf_listener_(),                         // transform frames from camera and lidar to our map
+          have_map_(false),                       // no map by default
+          map_frame_("map"),                      // default map frame name
+          robot_frame_("base_link"),              // default robot frame name
+          robot_pose_topic_("/state_estimation"), // default odom topic name
+          free_threshold_(20),                    // occupancy <= 20 = free, change this later
+          occ_threshold_(65),                     // >= 65 = occupied
+          min_frontier_cells_(10),                // minimum cluster size to consider a valid frontier
+          goal_topic_("/next_goal"),              // topic to publish PoseStamped goals
+          map_topic_("/map"),                     // topic to subscribe for occupany grid
+          fallback_enabled_(true),                // allow fallback when no map is available
+          fb_angle_(0.0),
+          fb_radius_(1.0),
+          fb_radius_max_(5.0),
+          fb_angle_step_(M_PI / 6.0), // 30 degrees per tick
+          fb_radius_step_(0.2),       // expand radius slowly
+          robot_radius_(0.30),        // meters, approximate
+          safety_margin_(0.20)        // meters, extra clearance
     {
         // Allow overriding defaults via private parameters (from launch file / param server)
         pnh_.param<string>("map_frame", map_frame_, map_frame_);
         pnh_.param<string>("robot_frame", robot_frame_, robot_frame_);
+        pnh_.param<string>("robot_pose_topic", robot_pose_topic_, robot_pose_topic_);
         pnh_.param<int>("free_threshold", free_threshold_, free_threshold_);
         pnh_.param<int>("occ_threshold", occ_threshold_, occ_threshold_);
         pnh_.param<int>("min_frontier_cells", min_frontier_cells_, min_frontier_cells_);
         pnh_.param<string>("goal_topic", goal_topic_, goal_topic_);
         pnh_.param<string>("map_topic", map_topic_, map_topic_);
+        pnh_.param<bool>("fallback_enabled", fallback_enabled_, fallback_enabled_);
+        pnh_.param<double>("fallback_radius_max", fb_radius_max_, fb_radius_max_);
+        pnh_.param<double>("robot_radius", robot_radius_, robot_radius_);
+        pnh_.param<double>("safety_margin", safety_margin_, safety_margin_);
 
         // Subscribe to the occupancy grid map; queue size 1 since we only need the latest map.
         map_sub_ = nh_.subscribe<nav_msgs::OccupancyGrid>(
             map_topic_, 1, &FrontierExplorer::mapCallback, this);
+
+        // Subscribe to odometry as a fallback pose source
+        odom_sub_ = nh_.subscribe<nav_msgs::Odometry>(
+            robot_pose_topic_, 1, &FrontierExplorer::odomCallback, this);
 
         // Advertise the next-goal topic where we publish the selected frontier as a PoseStamped.
         goal_pub_ = nh_.advertise<geometry_msgs::PoseStamped>(goal_topic_, 1);
@@ -77,6 +97,11 @@ public: // accessible outside the class
     }
 
 private:
+    // Odometry callback to cache a recent robot pose as a TF fallback
+    void odomCallback(const nav_msgs::Odometry::ConstPtr &msg)
+    {
+        last_odom_ = *msg;
+    }
     // Callback when a new map (OccupancyGrid) message arrives.
     void mapCallback(const nav_msgs::OccupancyGrid::ConstPtr &msg)
     {
@@ -88,10 +113,33 @@ private:
     // Timer callback executed periodically to detect frontiers and publish a goal.
     void onTimer(const ros::TimerEvent &)
     {
-        // If we have no map yet, do nothing.
+        // If we have no map yet, optionally run a simple TF-based fallback exploration
         if (!have_map_)
         {
-            ROS_WARN_THROTTLE(5.0, "FrontierExplorer: waiting for map on %s", map_topic_.c_str());
+            if (!fallback_enabled_)
+            {
+                ROS_WARN_THROTTLE(5.0, "FrontierExplorer: waiting for map on %s", map_topic_.c_str());
+                return;
+            }
+            double rx = 0.0, ry = 0.0, ryaw = 0.0;
+            if (!getRobotPose(rx, ry, ryaw))
+            {
+                ROS_WARN_THROTTLE(2.0, "FrontierExplorer: fallback waiting for TF (%s -> %s)",
+                                  map_frame_.c_str(), robot_frame_.c_str());
+                return;
+            }
+            // publish a goal along a growing circle around the robot
+            geometry_msgs::Point p;
+            p.x = rx + fb_radius_ * std::cos(fb_angle_);
+            p.y = ry + fb_radius_ * std::sin(fb_angle_);
+            p.z = 0.0;
+            publishGoal(p);
+            fb_angle_ += fb_angle_step_;
+            if (fb_angle_ > 2.0 * M_PI)
+                fb_angle_ -= 2.0 * M_PI;
+            // slowly expand radius up to max
+            fb_radius_ = std::min(fb_radius_ + fb_radius_step_, fb_radius_max_);
+            ROS_INFO_THROTTLE(2.0, "FrontierExplorer(fallback): publishing exploratory goal (r=%.1f)", fb_radius_);
             return;
         }
 
@@ -121,8 +169,9 @@ private:
         // Select the best frontier (closest centroid to robot in Euclidean distance).
         Frontier best = selectBestFrontier(frontiers, rx, ry);
 
-        // Publish the chosen frontier centroid as a PoseStamped goal in the map frame.
-        publishGoal(best.centroid);
+        // Choose a safe goal within the selected frontier (with clearance), else back off.
+        geometry_msgs::Point goal = chooseSafeGoal(latest_map_, best, rx, ry);
+        publishGoal(goal);
     }
 
     // Look up the robot pose (x, y, yaw) in the map frame using TF.
@@ -142,9 +191,56 @@ private:
         }
         catch (const tf::TransformException &ex)
         {
-            // If TF throws, log the reason and return false.
-            ROS_WARN("TF lookup failed: %s", ex.what());
-            return false;
+            // First, try common alternative robot frames before giving up.
+            std::vector<string> candidates = {robot_frame_, string("base_link"), string("base_footprint"), string("base")};
+            bool tf_ok = false;
+            for (const auto &cand : candidates)
+            {
+                try
+                {
+                    tf_listener_.waitForTransform(target_frame, cand, ros::Time(0), ros::Duration(0.1));
+                    tf_listener_.lookupTransform(target_frame, cand, ros::Time(0), transform);
+                    if (cand != robot_frame_)
+                    {
+                        ROS_WARN("FrontierExplorer: using alternative robot_frame '%s' (param was '%s')", cand.c_str(), robot_frame_.c_str());
+                        robot_frame_ = cand; // remember for next time
+                    }
+                    tf_ok = true;
+                    break;
+                }
+                catch (const tf::TransformException &)
+                {
+                    // try next
+                }
+            }
+            if (!tf_ok)
+            {
+                // TF failed. Try odometry fallback if frames are consistent with map_frame.
+                ROS_WARN("TF lookup failed: %s", ex.what());
+                if (!last_odom_.header.frame_id.empty())
+                {
+                    const std::string &odom_frame = last_odom_.header.frame_id;
+                    if (odom_frame == map_frame_ || (!latest_map_.header.frame_id.empty() && odom_frame == latest_map_.header.frame_id))
+                    {
+                        x = last_odom_.pose.pose.position.x;
+                        y = last_odom_.pose.pose.position.y;
+                        double roll, pitch;
+                        tf::Quaternion q;
+                        tf::quaternionMsgToTF(last_odom_.pose.pose.orientation, q);
+                        tf::Matrix3x3(q).getRPY(roll, pitch, yaw);
+                        ROS_INFO_THROTTLE(2.0, "FrontierExplorer: using Odometry pose (frame=%s) as fallback", odom_frame.c_str());
+                        return true;
+                    }
+                    else
+                    {
+                        ROS_WARN_THROTTLE(2.0,
+                                          "FrontierExplorer: odom frame (%s) != map_frame (%s). Set param robot_frame to a valid TF child (e.g., base_link/base_footprint) or set map_frame to odom frame, or provide a static transform.",
+                                          odom_frame.c_str(), map_frame_.c_str());
+                    }
+                }
+                return false;
+            }
+            // else: we have a transform in 'transform' from an alternative frame. Continue below to extract pose.
         }
         // Extract translation (x, y) from the transform origin.
         x = transform.getOrigin().x();
@@ -387,6 +483,103 @@ private:
         return frontiers[best_idx];
     }
 
+    // Compute whether cell (r,c) has at least 'clearance_cells' of free/unknown from occupied
+    bool hasClearance(const nav_msgs::OccupancyGrid &map, int r, int c, int clearance_cells) const
+    {
+        const int w = static_cast<int>(map.info.width);
+        const int h = static_cast<int>(map.info.height);
+        for (int dr = -clearance_cells; dr <= clearance_cells; ++dr)
+        {
+            for (int dc = -clearance_cells; dc <= clearance_cells; ++dc)
+            {
+                int nr = r + dr;
+                int nc = c + dc;
+                if (nr < 0 || nr >= h || nc < 0 || nc >= w)
+                    continue;
+                // circle mask (approx): skip corners outside radius
+                if (dr * dr + dc * dc > clearance_cells * clearance_cells)
+                    continue;
+                int8_t occ = map.data[idx(nr, nc, w)];
+                if (occ >= occ_threshold_) // definitely occupied
+                    return false;
+            }
+        }
+        return true;
+    }
+
+    // Choose a safe goal point inside the selected frontier cluster.
+    // Strategy: among frontier cells, prefer those with sufficient clearance; rank by
+    // (1) closeness to robot to reduce travel and (2) high clearance.
+    geometry_msgs::Point chooseSafeGoal(const nav_msgs::OccupancyGrid &map, const Frontier &frontier, double rx, double ry)
+    {
+        geometry_msgs::Point best_p = frontier.centroid;
+        double best_score = std::numeric_limits<double>::infinity();
+        const double res = map.info.resolution;
+        const double ox = map.info.origin.position.x;
+        const double oy = map.info.origin.position.y;
+        const int w = static_cast<int>(map.info.width);
+        const int h = static_cast<int>(map.info.height);
+        const int clearance_cells = std::max(1, static_cast<int>(std::floor((robot_radius_ + safety_margin_) / res)));
+
+        // Evaluate each frontier cell
+        for (const auto &p : frontier.cells)
+        {
+            int c = static_cast<int>(std::floor((p.x - ox) / res));
+            int r = static_cast<int>(std::floor((p.y - oy) / res));
+            if (r < 0 || r >= h || c < 0 || c >= w)
+                continue;
+            int8_t occ = map.data[idx(r, c, w)];
+            if (occ < 0 || occ > free_threshold_) // require free-ish cell
+                continue;
+            if (!hasClearance(map, r, c, clearance_cells))
+                continue;
+            // Score: distance to robot (prefer closer)
+            double dx = p.x - rx;
+            double dy = p.y - ry;
+            double score = dx * dx + dy * dy;
+            if (score < best_score)
+            {
+                best_score = score;
+                best_p = p;
+            }
+        }
+
+        if (best_score != std::numeric_limits<double>::infinity())
+            return best_p;
+
+        // Fallback: back off from centroid toward robot until clearance is found
+        geometry_msgs::Point p = frontier.centroid;
+        double vx = rx - p.x;
+        double vy = ry - p.y;
+        double vnorm = std::hypot(vx, vy);
+        if (vnorm < 1e-3)
+        {
+            vx = 1.0;
+            vy = 0.0;
+            vnorm = 1.0;
+        }
+        vx /= vnorm;
+        vy /= vnorm;
+        int max_steps = std::max(3, clearance_cells * 2);
+        for (int k = 1; k <= max_steps; ++k)
+        {
+            geometry_msgs::Point q;
+            q.x = p.x + (-vx) * res * k; // step slightly away from frontier (toward robot)
+            q.y = p.y + (-vy) * res * k;
+            q.z = 0.0;
+            int c = static_cast<int>(std::floor((q.x - ox) / res));
+            int r = static_cast<int>(std::floor((q.y - oy) / res));
+            if (r < 0 || r >= h || c < 0 || c >= w)
+                continue;
+            int8_t occ = map.data[idx(r, c, w)];
+            if (occ >= 0 && occ <= free_threshold_ && hasClearance(map, r, c, clearance_cells))
+                return q;
+        }
+
+        // Final fallback: return centroid (may be tight)
+        return frontier.centroid;
+    }
+
     // Publish a PoseStamped at the given world point (map frame) as the next goal.
     void publishGoal(const geometry_msgs::Point &p)
     {
@@ -411,21 +604,19 @@ private:
 
 private:
     // Node handles (global and private) for parameters and topic setup.
-    ros::NodeHandle nh_;
-    ros::NodeHandle pnh_;
-
-    // TF listener to query transforms between frames (map -> base_link).
+    ros::NodeHandle nh_, pnh_;
     tf::TransformListener tf_listener_;
-
-    // Subscriber for the occupancy grid map.
     ros::Subscriber map_sub_;
+    ros::Subscriber odom_sub_;
     // Publisher for the next frontier goal.
     ros::Publisher goal_pub_;
+    string robot_pose_topic_;
     // Timer for periodic processing of frontier detection and goal selection.
     ros::Timer timer_;
 
     // Latest map and a flag indicating whether we have received one.
     nav_msgs::OccupancyGrid latest_map_;
+    nav_msgs::Odometry last_odom_;
     bool have_map_;
 
     // Frames and topics configurable via parameters.
@@ -438,6 +629,17 @@ private:
     int free_threshold_;
     int occ_threshold_;
     int min_frontier_cells_;
+
+    // Fallback exploration state (when no map is available)
+    bool fallback_enabled_;
+    double fb_angle_;
+    double fb_radius_;
+    double fb_radius_max_;
+    double fb_angle_step_;
+    double fb_radius_step_;
+    // Clearance parameters
+    double robot_radius_;
+    double safety_margin_;
 };
 
 int main(int argc, char **argv)

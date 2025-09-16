@@ -6,6 +6,7 @@
 #include <ros/ros.h>
 
 #include <nav_msgs/Odometry.h>
+#include <nav_msgs/OccupancyGrid.h>
 #include <geometry_msgs/Pose2D.h>
 #include <visualization_msgs/Marker.h>
 #include <std_msgs/String.h>
@@ -13,6 +14,7 @@
 
 #include <tf/transform_datatypes.h>
 #include <tf/transform_broadcaster.h>
+#include <tf/transform_listener.h>
 
 #include <algorithm> // transform
 #include <cctype>    // to lower
@@ -45,6 +47,13 @@ static ros::Publisher g_waypointPub;
 
 // gate to enable/disable frontier bridging from chat
 static bool g_frontierEnabled = false;
+static ros::Time g_lastNextGoal;      // time we last saw a /next_goal
+static ros::Time g_lastBridgedGoal;   // time we last bridged to /way_point_with_heading
+static nav_msgs::Odometry g_lastOdom; // to check pose freshness
+static ros::Time g_lastMapTime;       // latest /map stamp observed (if we subscribe to map)
+// frames for diagnostics (configurable via params)
+static std::string g_mapFrame = "map";
+static std::string g_robotFrame = "base_link";
 
 // forward declarations
 // Receives PoseStamped on /next_goal and republishes Pose2D to /way_point_with_heading
@@ -72,6 +81,8 @@ void nextGoalCb(const geometry_msgs::PoseStamped::ConstPtr &msg)
 
   // Publish to the local planner’s expected topic
   g_waypointPub.publish(out);
+  g_lastNextGoal = ros::Time::now();
+  g_lastBridgedGoal = g_lastNextGoal;
 
   // Log for visibility
   ROS_INFO("Frontier bridge: sent goal to /way_point_with_heading (%.2f, %.2f)", out.x, out.y);
@@ -472,13 +483,81 @@ void poseHandler(const nav_msgs::Odometry::ConstPtr &pose)
 {
   vehicleX = pose->pose.pose.position.x;
   vehicleY = pose->pose.pose.position.y;
-  ROS_INFO_THROTTLE(1.0, "Odom x=%.2f y=%.2f", vehicleX, vehicleY);
+  g_lastOdom = *pose;
+  ROS_INFO_THROTTLE(1.0, "Odom x=%.2f y=%.2f (frame=%s child=%s)", vehicleX, vehicleY,
+                    pose->header.frame_id.c_str(), pose->child_frame_id.c_str());
+}
+
+// optional: map stamp tracker for diagnostics
+void mapStampHandler(const nav_msgs::OccupancyGrid::ConstPtr &msg)
+{
+  g_lastMapTime = msg->header.stamp;
 }
 
 void questionHandler(const std_msgs::String::ConstPtr &msg)
 {
   ROS_INFO("Received question");
   question = msg->data;
+}
+
+// Periodic diagnostics: prints status about frontier bridging and required topics/TF
+void diagnosticsTimerCb(const ros::TimerEvent &)
+{
+  if (!g_frontierEnabled)
+    return; // only chatty when frontier mode is on
+
+  ros::Time now = ros::Time::now();
+
+  // (Optional) Could query ROS master for topic presence, but keep diagnostics lightweight here
+
+  // Planner subscriber count on /way_point_with_heading
+  int plannerSubs = g_waypointPub.getNumSubscribers();
+
+  // Odom age
+  double odomAge = (now - g_lastOdom.header.stamp).toSec();
+  // Map age (if we saw any)
+  double mapAge = g_lastMapTime.isZero() ? -1.0 : (now - g_lastMapTime).toSec();
+  // Last bridged goal age
+  double bridgedAge = g_lastBridgedGoal.isZero() ? -1.0 : (now - g_lastBridgedGoal).toSec();
+
+  // TF availability: try a quick lookup to see if map->base_link exists
+  static tf::TransformListener tfListener;
+  bool tfOk = true;
+  try
+  {
+    tf::StampedTransform t;
+    tfListener.lookupTransform(g_mapFrame, g_robotFrame, ros::Time(0), t);
+  }
+  catch (const tf::TransformException &)
+  {
+    tfOk = false;
+  }
+
+  ROS_INFO_THROTTLE(2.0,
+                    "Frontier diag: plannerSubs=%d mapAge=%.1fs odomAge=%.1fs lastBridged=%.1fs tf=%s",
+                    plannerSubs,
+                    mapAge,
+                    odomAge,
+                    bridgedAge,
+                    tfOk ? "OK" : "MISSING");
+
+  if (plannerSubs == 0)
+  {
+    ROS_WARN_THROTTLE(2.0, "No subscribers on /way_point_with_heading (planner not running?)");
+  }
+  if (!tfOk)
+  {
+    ROS_WARN_THROTTLE(5.0, "TF %s->%s not available; frontier goals cannot be selected reliably",
+                      g_mapFrame.c_str(), g_robotFrame.c_str());
+  }
+  if (mapAge < 0.0)
+  {
+    ROS_WARN_THROTTLE(5.0, "No /map seen yet; frontier_explorer will wait");
+  }
+  if (bridgedAge < 0.0)
+  {
+    ROS_WARN_THROTTLE(5.0, "No /next_goal bridged yet; is frontier_explorer running?");
+  }
 }
 
 int main(int argc, char **argv)
@@ -490,6 +569,8 @@ int main(int argc, char **argv)
   nhPrivate.getParam("waypoint_file_dir", waypoint_file_dir);
   nhPrivate.getParam("object_list_file_dir", object_list_file_dir);
   nhPrivate.getParam("waypointReachDis", waypointReachDis);
+  nhPrivate.getParam("map_frame", g_mapFrame);
+  nhPrivate.getParam("robot_frame", g_robotFrame);
 
   ros::Subscriber subPose = nh.subscribe<nav_msgs::Odometry>("/state_estimation", 5, poseHandler);
 
@@ -510,6 +591,12 @@ int main(int argc, char **argv)
 
   // local alias for publishing waypoints inside this function
   ros::Publisher &waypointPub = g_waypointPub;
+
+  // optional: map subscriber for diagnostics (stamp only)
+  ros::Subscriber mapSubDiag = nh.subscribe<nav_msgs::OccupancyGrid>("/map", 1, mapStampHandler);
+
+  // diagnostics timer
+  ros::Timer diagTimer = nh.createTimer(ros::Duration(2.0), diagnosticsTimerCb);
 
   // read waypoints from file
   readWaypointFile();
