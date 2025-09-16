@@ -62,8 +62,8 @@ class CameraSaveAndDetect:
         self.image_dir_param = rospy.get_param('~image_dir', '')
         self.image_prefix = rospy.get_param('~image_prefix', 'image_')
         self.cleanup_images_on_startup = bool(rospy.get_param('~cleanup_images_on_startup', True))
-    # Shutdown when final answer is published
-    self.shutdown_on_final_answer = bool(rospy.get_param('~shutdown_on_final_answer', True))
+        # Shutdown when final answer is published
+        self.shutdown_on_final_answer = bool(rospy.get_param('~shutdown_on_final_answer', True))
 
         # Compute save path to match object_detection.py's default
         # object_detection.py lives in <pkg_dir>/src/object_detection.py
