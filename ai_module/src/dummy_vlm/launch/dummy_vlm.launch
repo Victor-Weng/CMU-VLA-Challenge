@@ -19,6 +19,7 @@
   <arg name="min_period_sec" default="0.5"/>
   <arg name="min_distance_m" default="0.5"/>
   <!-- Image save and detection from ROS camera topic -->
+  <arg name="enable_camera_saver" default="false"/>
   <arg name="detect_interval_sec" default="10.0"/>
   <arg name="detect_model" default="yolov8n.pt"/>
   <arg name="detect_save_path" default=""/>
@@ -26,6 +27,8 @@
   <arg name="paired_detect_model" default="yolov8n.pt"/>
   <arg name="paired_detect_save_path" default="/home/victor/CMU-VLA-Challenge/ai_module/src/data/image.png"/>
   <arg name="paired_angle_window_deg" default="1.5"/>
+  <arg name="paired_tf_time_policy" default="latest"/>
+  <arg name="paired_tf_use_latest_fallback" default="true"/>
 
   <node pkg="dummy_vlm" type="dummyVLM" name="dummyVLM" output="screen" required="true">
     <param name="waypoint_file_dir" type="string" value="$(find dummy_vlm)/data/waypoints.ply" />
@@ -109,7 +112,7 @@
   </node>
 
   <!-- Subscribe to camera topic, save image every N seconds, and run detection script -->
-  <node pkg="dummy_vlm" type="camera_save_and_detect.py" name="camera_save_and_detect" output="screen">
+  <node if="$(arg enable_camera_saver)" pkg="dummy_vlm" type="camera_save_and_detect.py" name="camera_save_and_detect" output="screen">
     <param name="image_topic" value="$(arg image_topic)"/>
     <param name="interval_sec" value="$(arg detect_interval_sec)"/>
     <param name="model" value="$(arg detect_model)"/>
@@ -123,6 +126,8 @@
     <param name="model" value="$(arg paired_detect_model)"/>
     <param name="save_path" value="$(arg paired_detect_save_path)"/>
     <param name="angle_window_deg" value="$(arg paired_angle_window_deg)"/>
+    <param name="tf_time_policy" value="$(arg paired_tf_time_policy)"/>
+    <param name="tf_use_latest_fallback" value="$(arg paired_tf_use_latest_fallback)"/>
   </node>
 
 </launch>

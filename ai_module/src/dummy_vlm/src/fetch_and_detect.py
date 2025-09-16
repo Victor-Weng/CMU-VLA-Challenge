@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Fetch an image from an HTTP(S) endpoint every N seconds, save it to the
-repo's default data/image.jpg path used by object_detection.py, and then
+repo's default data/image.png path used by object_detection.py, and then
 run the detector.
 
 Usage:
@@ -27,7 +27,7 @@ def resolve_default_image_path() -> str:
     project_root = os.path.abspath(os.path.join(script_dir, "..", ".."))
     data_dir = os.path.join(project_root, "data")
     os.makedirs(data_dir, exist_ok=True)
-    return os.path.join(data_dir, "image.jpg")
+    return os.path.join(data_dir, "image.png")
 
 
 def download_image(url: str, dest_path: str, timeout: float = 10.0):
@@ -79,7 +79,7 @@ def main() -> int:
     parser.add_argument("--url", required=True, help="HTTP(S) endpoint returning an image")
     parser.add_argument("--interval", type=float, default=10.0, help="Seconds between fetches (default: 10)")
     parser.add_argument("--model", default="yolov8n.pt", help="YOLOv8 model name/path (default: yolov8n.pt)")
-    parser.add_argument("--save", help="Optional override save path (default: <repo_root>/data/image.jpg)")
+    parser.add_argument("--save", help="Optional override save path (default: <repo_root>/data/image.png)")
     parser.add_argument("--once", action="store_true", help="Fetch and detect once, then exit")
     args = parser.parse_args()
 

@@ -15,7 +15,8 @@ def main():
     if not args.image:
         script_dir = os.path.dirname(os.path.abspath(__file__))
         project_root = os.path.abspath(os.path.join(script_dir, "..", ".."))
-        args.image = os.path.join(project_root, "dummy_vlm", "data", "image.png")
+        # Default to <repo_root>/data/image.png (matches paired_detect_and_depth and launch)
+        args.image = os.path.join(project_root, "data", "image.png")
 
     if not os.path.isfile(args.image):
         print(f"Error: image not found: {args.image}", file=sys.stderr)

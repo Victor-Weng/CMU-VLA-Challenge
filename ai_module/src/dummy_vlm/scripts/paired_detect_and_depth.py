@@ -60,6 +60,9 @@ class PairedDetectAndDepth:
         self.save_path = rospy.get_param('~save_path', '')  # default computed below
         self.object_list_path = rospy.get_param('~object_list_path', '')
         self.angle_window_deg = float(rospy.get_param('~angle_window_deg', 1.5))
+        # TF behavior: which timestamp to use for transform lookup: 'image' | 'cloud' | 'latest'
+        self.tf_time_policy = rospy.get_param('~tf_time_policy', 'image')
+        self.tf_use_latest_fallback = bool(rospy.get_param('~tf_use_latest_fallback', True))
 
         # Resolve default paths
         this_dir = os.path.dirname(os.path.abspath(__file__))  # <pkg>/scripts
@@ -155,22 +158,42 @@ class PairedDetectAndDepth:
             rospy.loginfo('paired_detect_and_depth: no detections to fuse')
             return
 
-        # Prepare TF transform from point cloud frame to camera frame at the image timestamp
-        try:
-            self.tf_listener.waitForTransform(img_frame, pc_frame, stamp, rospy.Duration(0.2))
-            (trans, rot) = self.tf_listener.lookupTransform(img_frame, pc_frame, stamp)
-            T = self._tf_to_matrix(trans, rot)
-        except (tf.Exception, tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException) as e:
-            rospy.logwarn('TF transform %s -> %s at t=%.3f unavailable: %s', pc_frame, img_frame, stamp.to_sec(), str(e))
+        # Prepare TF transform from point cloud frame to camera frame
+        # Choose time based on policy
+        if img_frame == pc_frame:
+            T = np.eye(4, dtype=np.float32)
+        else:
+            if self.tf_time_policy == 'cloud':
+                target_time = pc_msg.header.stamp
+            elif self.tf_time_policy == 'latest':
+                target_time = rospy.Time(0)
+            else:
+                target_time = img_msg.header.stamp
             T = None
+            try:
+                if target_time != rospy.Time(0):
+                    self.tf_listener.waitForTransform(img_frame, pc_frame, target_time, rospy.Duration(0.4))
+                (trans, rot) = self.tf_listener.lookupTransform(img_frame, pc_frame, target_time)
+                T = self._tf_to_matrix(trans, rot)
+            except (tf.Exception, tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException) as e:
+                rospy.logwarn('TF %s -> %s at t=%s unavailable: %s', pc_frame, img_frame,
+                              ('latest' if target_time == rospy.Time(0) else f"{target_time.to_sec():.3f}"), str(e))
+                # Optional fallback to latest
+                if self.tf_use_latest_fallback and target_time != rospy.Time(0):
+                    try:
+                        (trans, rot) = self.tf_listener.lookupTransform(img_frame, pc_frame, rospy.Time(0))
+                        T = self._tf_to_matrix(trans, rot)
+                        rospy.loginfo('paired_detect_and_depth: using latest TF for %s->%s', pc_frame, img_frame)
+                    except Exception as e2:
+                        rospy.logwarn('TF latest fallback failed: %s', str(e2))
+                        T = None
 
         # Read points and optionally transform to camera frame
         points = pc2.read_points(pc_msg, field_names=['x', 'y', 'z'], skip_nans=True)
         pts_cam = []
         if T is None:
-            # Assume cloud already in camera frame (best-effort)
-            for p in points:
-                pts_cam.append((p[0], p[1], p[2]))
+            rospy.logwarn('paired_detect_and_depth: skipping fusion due to missing TF between %s and %s', pc_frame, img_frame)
+            return
         else:
             # Transform all points to camera frame using numpy for speed
             arr = np.fromiter(points, dtype=[('x', 'f4'), ('y', 'f4'), ('z', 'f4')])

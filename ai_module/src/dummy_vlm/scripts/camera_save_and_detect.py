@@ -60,18 +60,18 @@ class CameraSaveAndDetect:
         objdet_dir = os.path.join(pkg_dir, 'src')
         project_root = os.path.abspath(os.path.join(objdet_dir, '..', '..'))  # mimics object_detection.py logic
         data_dir = os.path.join(project_root, 'data')
-        default_save_path = os.path.join(data_dir, 'image.jpg')
+        default_save_path = os.path.join(data_dir, 'image.png')
         self.save_path = self.save_path_param if self.save_path_param else default_save_path
         self.detector_script = os.path.join(objdet_dir, 'object_detection.py')
 
         # Also compute alternate save paths for compatibility, if enabled
         alt_root = os.path.abspath(os.path.join(objdet_dir, '..', '..', '..'))  # -> <repo>/ai_module
         self.alt_data_dir = os.path.join(alt_root, 'data')  # <repo>/ai_module/data
-        self.alt_save_path = os.path.join(self.alt_data_dir, os.path.basename(self.save_path) or 'image.jpg')
+        self.alt_save_path = os.path.join(self.alt_data_dir, os.path.basename(self.save_path) or 'image.png')
         # A second alternative matching <repo>/ai_module/src/data (as seen in earlier logs)
         alt_src_data_dir = os.path.join(alt_root, 'src', 'data')
         self.alt2_data_dir = alt_src_data_dir
-        self.alt2_save_path = os.path.join(alt_src_data_dir, os.path.basename(self.save_path) or 'image.jpg')
+        self.alt2_save_path = os.path.join(alt_src_data_dir, os.path.basename(self.save_path) or 'image.png')
 
         # Ensure data dir exists
         try:
