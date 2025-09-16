@@ -4,6 +4,16 @@
   <arg name="map_frame" default="map"/>
   <arg name="robot_frame" default="sensor"/>
   <arg name="robot_pose_topic" default="/state_estimation"/>
+  <!-- Go-home recovery options -->
+  <arg name="go_home_on_long_stagnation" default="true"/>
+  <arg name="long_stagnation_sec" default="30.0"/>
+  <arg name="home_x" default="0.0"/>
+  <arg name="home_y" default="0.0"/>
+  <arg name="home_pause_sec" default="1.0"/>
+  <arg name="image_topic" default="/camera/image"/>
+  <arg name="lidar_topic" default="/registered_scan"/>
+  <arg name="min_period_sec" default="0.5"/>
+  <arg name="min_distance_m" default="0.5"/>
 
   <node pkg="dummy_vlm" type="dummyVLM" name="dummyVLM" output="screen" required="true">
     <param name="waypoint_file_dir" type="string" value="$(find dummy_vlm)/data/waypoints.ply" />
@@ -23,6 +33,12 @@
     <param name="recovery_step_wait_sec" value="1.5"/>
     <param name="recovery_turn_wait_sec" value="1.0"/>
     <param name="recovery_reach_thresh" value="0.15"/>
+    <!-- New: go-home recovery parameters -->
+    <param name="go_home_on_long_stagnation" value="$(arg go_home_on_long_stagnation)"/>
+    <param name="long_stagnation_sec" value="$(arg long_stagnation_sec)"/>
+    <param name="home_x" value="$(arg home_x)"/>
+    <param name="home_y" value="$(arg home_y)"/>
+    <param name="home_pause_sec" value="$(arg home_pause_sec)"/>
   </node>
   <!-- Simple converter: /terrain_map (PointCloud2) -> /map (OccupancyGrid) -->
   <node pkg="dummy_vlm" type="pc_to_grid" name="pc_to_grid" output="screen">
@@ -65,6 +81,15 @@
     <param name="min_progress" value="0.30"/>
     <param name="recent_goal_block_s" value="12.0"/>
     <param name="recent_goal_radius_m" value="0.6"/>
+  </node>
+
+  <!-- Capture synchronized image+LiDAR pairs with time/distance gating -->
+  <node pkg="dummy_vlm" type="image_lidar_capture" name="image_lidar_capture" output="screen">
+    <param name="image_topic" value="$(arg image_topic)"/>
+    <param name="lidar_topic" value="$(arg lidar_topic)"/>
+    <param name="odom_topic" value="$(arg robot_pose_topic)"/>
+    <param name="min_period_sec" value="$(arg min_period_sec)"/>
+    <param name="min_distance_m" value="$(arg min_distance_m)"/>
   </node>
 
 </launch>

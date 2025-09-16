@@ -27,12 +27,11 @@
 
 using json = nlohmann::json;
 
-
 using namespace std;
 
 string waypoint_file_dir;
 string object_list_file_dir;
-double waypointReachDis = 1.0; // how far from waypont is considered "reached"
+double waypointReachDis = 0.3; // how far from waypont is considered "reached"
 
 vector<float> waypointX, waypointY, waypointHeading;
 
@@ -87,6 +86,13 @@ static double g_recoveryBackupDist = 0.30;  // meters to back up before turning
 static double g_recoveryStepWaitSec = 1.5;  // seconds to wait for backup step
 static double g_recoveryTurnWaitSec = 1.0;  // seconds to wait for the turn step
 static double g_recoveryReachThresh = 0.15; // meters to consider backup reached
+
+// --- Alternative recovery: go home (0,0) and pause ---
+static bool g_goHomeOnLongStagnation = true; // enable go-home recovery
+static double g_longStagnationSec = 30.0;    // how long of no progress triggers go-home
+static double g_homeX = 0.0, g_homeY = 0.0;  // home waypoint in map frame
+static double g_homePauseSec = 1.0;          // pause duration at home before resuming
+static ros::Time g_lastProgress;             // last time we detected movement >= g_minMove
 
 // Helper: record (and de-dup) waypoint events
 static inline void recordWaypoint(const geometry_msgs::Pose2D &wp)
@@ -246,59 +252,61 @@ void readObjectListFile()
     objLabel += s[i];
 }
 
-
-//Mistral API Function
-// Callback for curl to write response data
-static size_t WriteCallback(void* contents, size_t size, size_t nmemb, void* userp) {
-    ((std::string*)userp)->append((char*)contents, size * nmemb);
-    return size * nmemb;
+// Mistral API Function
+//  Callback for curl to write response data
+static size_t WriteCallback(void *contents, size_t size, size_t nmemb, void *userp)
+{
+  ((std::string *)userp)->append((char *)contents, size * nmemb);
+  return size * nmemb;
 }
 
 // Function to send a question to Mistral and get the response
-std::string askMistral(const std::string& question) {
-    std::string response;
+std::string askMistral(const std::string &question)
+{
+  std::string response;
 
-    CURL* curl = curl_easy_init();
-    if (!curl) {
-        std::cerr << "Failed to initialize curl." << std::endl;
-        return "";
-    }
+  CURL *curl = curl_easy_init();
+  if (!curl)
+  {
+    std::cerr << "Failed to initialize curl." << std::endl;
+    return "";
+  }
 
-    std::string url = "https://api.mistral.ai/v1/chat/completions";
-    std::string payload = R"({"model":"mistral-large-latest","messages":[{"role":"user","content":")"
-                          + question + "\"}]}";
+  std::string url = "https://api.mistral.ai/v1/chat/completions";
+  std::string payload = R"({"model":"mistral-large-latest","messages":[{"role":"user","content":")" + question + "\"}]}";
 
-    struct curl_slist* headers = nullptr;
-    headers = curl_slist_append(headers, "Content-Type: application/json");
-    headers = curl_slist_append(headers, "Authorization: Bearer OFgLAX07gC1v65hDAfeU4AoZNI9ehcMa");
+  struct curl_slist *headers = nullptr;
+  headers = curl_slist_append(headers, "Content-Type: application/json");
+  headers = curl_slist_append(headers, "Authorization: Bearer OFgLAX07gC1v65hDAfeU4AoZNI9ehcMa");
 
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payload.c_str());
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+  curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+  curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payload.c_str());
+  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+  curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
 
-    CURLcode res = curl_easy_perform(curl);
-    if (res != CURLE_OK) {
-        std::cerr << "Curl failed: " << curl_easy_strerror(res) << std::endl;
-        response = "";
-    }
+  CURLcode res = curl_easy_perform(curl);
+  if (res != CURLE_OK)
+  {
+    std::cerr << "Curl failed: " << curl_easy_strerror(res) << std::endl;
+    response = "";
+  }
 
-    curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
+  curl_slist_free_all(headers);
+  curl_easy_cleanup(curl);
 
-    // Parse JSON to get assistant content
-    try {
-        auto j = json::parse(response);
-        return j["choices"][0]["message"]["content"];
-    } catch (...) {
-        std::cerr << "Failed to parse response." << std::endl;
-        return "";
-    }
+  // Parse JSON to get assistant content
+  try
+  {
+    auto j = json::parse(response);
+    return j["choices"][0]["message"]["content"];
+  }
+  catch (...)
+  {
+    std::cerr << "Failed to parse response." << std::endl;
+    return "";
+  }
 }
-
-
-
 
 // handle navigator commands (to be replaced by LLM later)
 // Parse and execute simple nav commands
@@ -465,15 +473,15 @@ bool handleNavCommand(const std::string &q, ros::Publisher &waypointPub, geometr
     waypointHeading = oldH;
     return true;
   }
-  //Mistral API
-  //Print the mistral api output with ROS-INFO
+  // Mistral API
+  // Print the mistral api output with ROS-INFO
 
   std::string mistralOutput = askMistral(s);
-    if (!mistralOutput.empty())
-    {
-        ROS_INFO("Mistral says: %s", mistralOutput.c_str());
-        return true;
-    }
+  if (!mistralOutput.empty())
+  {
+    ROS_INFO("Mistral says: %s", mistralOutput.c_str());
+    return true;
+  }
   return false;
 }
 
@@ -613,6 +621,7 @@ void poseHandler(const nav_msgs::Odometry::ConstPtr &pose)
     g_refX = vehicleX;
     g_refY = vehicleY;
     g_refStamp = ros::Time::now();
+    g_lastProgress = g_refStamp;
   }
   ROS_INFO_THROTTLE(1.0, "Odom x=%.2f y=%.2f (frame=%s child=%s)", vehicleX, vehicleY,
                     pose->header.frame_id.c_str(), pose->child_frame_id.c_str());
@@ -708,6 +717,8 @@ void diagnosticsTimerCb(const ros::TimerEvent &)
       double moved = std::sqrt(dx * dx + dy * dy);
       if (moved < g_minMove)
         notMoving = true;
+      else
+        g_lastProgress = now;
       // reset window
       g_refX = vehicleX;
       g_refY = vehicleY;
@@ -717,6 +728,24 @@ void diagnosticsTimerCb(const ros::TimerEvent &)
     // Start a recovery sequence if not already in one
     if (g_recoveryPhase == 0 && (goalsStagnant || notMoving) && (g_lastRecovery.isZero() || (now - g_lastRecovery).toSec() > g_recoveryCooldown))
     {
+      // If configured and stagnation is long, prefer go-home instead of backup-turn
+      bool longStagnation = g_goHomeOnLongStagnation && !g_lastProgress.isZero() && ((now - g_lastProgress).toSec() > g_longStagnationSec);
+      if (longStagnation)
+      {
+        geometry_msgs::Pose2D home;
+        home.x = g_homeX;
+        home.y = g_homeY;
+        home.theta = 0.0;
+        ROS_WARN("Recovery: long stagnation detected (%.0fs) -> going to home (%.2f, %.2f) and pausing %.1fs",
+                 (now - g_lastProgress).toSec(), g_homeX, g_homeY, g_homePauseSec);
+        g_waypointPub.publish(home);
+        recordWaypoint(home);
+        g_lastRecovery = now;
+        g_recoveryHoldUntil = now + ros::Duration(g_homePauseSec);
+        // Skip backup-turn path this time
+        return;
+      }
+
       // Compute yaw from odometry
       tf::Quaternion q;
       tf::quaternionMsgToTF(g_lastOdom.pose.pose.orientation, q);
@@ -810,6 +839,11 @@ int main(int argc, char **argv)
   nhPrivate.param("recovery_step_wait_sec", g_recoveryStepWaitSec, g_recoveryStepWaitSec);
   nhPrivate.param("recovery_turn_wait_sec", g_recoveryTurnWaitSec, g_recoveryTurnWaitSec);
   nhPrivate.param("recovery_reach_thresh", g_recoveryReachThresh, g_recoveryReachThresh);
+  nhPrivate.param("go_home_on_long_stagnation", g_goHomeOnLongStagnation, g_goHomeOnLongStagnation);
+  nhPrivate.param("long_stagnation_sec", g_longStagnationSec, g_longStagnationSec);
+  nhPrivate.param("home_x", g_homeX, g_homeX);
+  nhPrivate.param("home_y", g_homeY, g_homeY);
+  nhPrivate.param("home_pause_sec", g_homePauseSec, g_homePauseSec);
 
   ros::Subscriber subPose = nh.subscribe<nav_msgs::Odometry>("/state_estimation", 5, poseHandler);
 
