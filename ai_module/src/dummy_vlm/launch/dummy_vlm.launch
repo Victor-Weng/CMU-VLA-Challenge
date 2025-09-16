@@ -21,6 +21,11 @@
   <!-- Image save and detection from ROS camera topic -->
   <arg name="detect_interval_sec" default="10.0"/>
   <arg name="detect_model" default="yolov8n.pt"/>
+  <arg name="detect_save_path" default=""/>
+  <!-- Paired detection + depth fusion config -->
+  <arg name="paired_detect_model" default="yolov8n.pt"/>
+  <arg name="paired_detect_save_path" default="/home/victor/CMU-VLA-Challenge/ai_module/src/data/image.png"/>
+  <arg name="paired_angle_window_deg" default="1.5"/>
 
   <node pkg="dummy_vlm" type="dummyVLM" name="dummyVLM" output="screen" required="true">
     <param name="waypoint_file_dir" type="string" value="$(find dummy_vlm)/data/waypoints.ply" />
@@ -108,6 +113,16 @@
     <param name="image_topic" value="$(arg image_topic)"/>
     <param name="interval_sec" value="$(arg detect_interval_sec)"/>
     <param name="model" value="$(arg detect_model)"/>
+    <param name="save_path" value="$(arg detect_save_path)"/>
+  </node>
+
+  <!-- Fuse paired image + point cloud: save image, run detection, estimate distance, append to object_list.txt -->
+  <node pkg="dummy_vlm" type="paired_detect_and_depth.py" name="paired_detect_and_depth" output="screen">
+    <param name="image_topic" value="/paired/image"/>
+    <param name="points_topic" value="/paired/points"/>
+    <param name="model" value="$(arg paired_detect_model)"/>
+    <param name="save_path" value="$(arg paired_detect_save_path)"/>
+    <param name="angle_window_deg" value="$(arg paired_angle_window_deg)"/>
   </node>
 
 </launch>

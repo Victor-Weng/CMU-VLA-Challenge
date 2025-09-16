@@ -15,7 +15,7 @@ def main():
     if not args.image:
         script_dir = os.path.dirname(os.path.abspath(__file__))
         project_root = os.path.abspath(os.path.join(script_dir, "..", ".."))
-        args.image = os.path.join(project_root, "data", "image.jpg")
+        args.image = os.path.join(project_root, "dummy_vlm", "data", "image.png")
 
     if not os.path.isfile(args.image):
         print(f"Error: image not found: {args.image}", file=sys.stderr)

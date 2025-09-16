@@ -6,8 +6,14 @@ import errno
 
 import rospy
 from sensor_msgs.msg import Image
-from cv_bridge import CvBridge, CvBridgeError
+try:
+    from cv_bridge import CvBridge, CvBridgeError
+except Exception:
+    CvBridge = None
+    class CvBridgeError(Exception):
+        pass
 import cv2
+import numpy as np
 
 
 class CameraSaveAndDetect:
@@ -15,7 +21,8 @@ class CameraSaveAndDetect:
         self.image_topic = rospy.get_param('~image_topic', '/camera/image')
         self.interval_sec = float(rospy.get_param('~interval_sec', 10.0))
         self.model = rospy.get_param('~model', 'yolov8n.pt')
-        self.run_if_no_subscribers = bool(rospy.get_param('~run_if_no_subscribers', True))
+        self.save_path_param = rospy.get_param('~save_path', '')  # if provided, overrides default path
+        self.extra_compat_writes = bool(rospy.get_param('~extra_compat_writes', True))
 
         # Compute save path to match object_detection.py's default
         # object_detection.py lives in <pkg_dir>/src/object_detection.py
@@ -24,8 +31,18 @@ class CameraSaveAndDetect:
         objdet_dir = os.path.join(pkg_dir, 'src')
         project_root = os.path.abspath(os.path.join(objdet_dir, '..', '..'))  # mimics object_detection.py logic
         data_dir = os.path.join(project_root, 'data')
-        self.save_path = os.path.join(data_dir, 'image.jpg')
+        default_save_path = os.path.join(data_dir, 'image.jpg')
+        self.save_path = self.save_path_param if self.save_path_param else default_save_path
         self.detector_script = os.path.join(objdet_dir, 'object_detection.py')
+
+        # Also compute alternate save paths for compatibility, if enabled
+        alt_root = os.path.abspath(os.path.join(objdet_dir, '..', '..', '..'))  # -> <repo>/ai_module
+        self.alt_data_dir = os.path.join(alt_root, 'data')  # <repo>/ai_module/data
+        self.alt_save_path = os.path.join(self.alt_data_dir, os.path.basename(self.save_path) or 'image.jpg')
+        # A second alternative matching <repo>/ai_module/src/data (as seen in earlier logs)
+        alt_src_data_dir = os.path.join(alt_root, 'src', 'data')
+        self.alt2_data_dir = alt_src_data_dir
+        self.alt2_save_path = os.path.join(alt_src_data_dir, os.path.basename(self.save_path) or 'image.jpg')
 
         # Ensure data dir exists
         try:
@@ -34,47 +51,94 @@ class CameraSaveAndDetect:
             if e.errno != errno.EEXIST:
                 raise
 
-        self.bridge = CvBridge()
+    self.bridge = CvBridge() if CvBridge is not None else None
         self.last_save_time = rospy.Time(0)
+        self.last_rx_time = rospy.Time(0)
 
         self.sub = rospy.Subscriber(self.image_topic, Image, self.image_cb, queue_size=1, buff_size=2**24)
-        rospy.loginfo('camera_save_and_detect: listening to %s, interval %.2fs, saving to %s',
-                      self.image_topic, self.interval_sec, self.save_path)
+        rospy.loginfo('camera_save_and_detect: listening to %s', self.image_topic)
+        rospy.loginfo('camera_save_and_detect: interval = %.2fs, model = %s', self.interval_sec, self.model)
+        rospy.loginfo('camera_save_and_detect: primary save path = %s', self.save_path)
+        if self.extra_compat_writes:
+            rospy.loginfo('camera_save_and_detect: compat save paths = %s, %s', self.alt_save_path, self.alt2_save_path)
 
     def image_cb(self, msg: Image):
         now = msg.header.stamp if msg.header.stamp and msg.header.stamp.to_sec() > 0 else rospy.Time.now()
-        if self.last_save_time.to_sec() > 0 and (now - self.last_save_time).to_sec() < self.interval_sec:
-            return
-
+        self.last_rx_time = now
+        # Basic frame info for debugging
         try:
-            cv_img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-        except CvBridgeError as e:
-            rospy.logwarn('cv_bridge bgr8 conversion failed (%s); trying passthrough', str(e))
+            enc = msg.encoding
+            rospy.logdebug('camera_save_and_detect: received image stamp=%.3f encoding=%s size=%dx%d',
+                           now.to_sec(), enc, msg.width, msg.height)
+            # Also surface occasional INFO to show liveness
+            rospy.loginfo_throttle(5.0, 'camera_save_and_detect: receiving images on %s (encoding=%s %dx%d) ...',
+                                   self.image_topic, enc, msg.width, msg.height)
+        except Exception:
+            pass
+
+        if self.last_save_time.to_sec() > 0:
+            elapsed = (now - self.last_save_time).toSec()
+            if elapsed < self.interval_sec:
+                rospy.logdebug('camera_save_and_detect: skipping save, %.2fs until next capture', self.interval_sec - elapsed)
+                return
+
+        cv_img = None
+        if self.bridge is not None:
             try:
-                cv_img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
-                # Convert single-channel to BGR for JPEG write consistency
-                if len(cv_img.shape) == 2:
-                    cv_img = cv2.cvtColor(cv_img, cv2.COLOR_GRAY2BGR)
-            except CvBridgeError as e2:
-                rospy.logwarn('cv_bridge passthrough failed: %s', str(e2))
+                cv_img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            except CvBridgeError as e:
+                rospy.logwarn('cv_bridge bgr8 conversion failed (%s); trying passthrough', str(e))
+                try:
+                    cv_img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
+                    if len(cv_img.shape) == 2:
+                        cv_img = cv2.cvtColor(cv_img, cv2.COLOR_GRAY2BGR)
+                except CvBridgeError as e2:
+                    rospy.logwarn('cv_bridge passthrough failed: %s', str(e2))
+                    cv_img = None
+        if cv_img is None:
+            # Fallback: direct NumPy conversion for common encodings
+            cv_img = self._rosimg_to_cv2(msg)
+            if cv_img is None:
+                rospy.logwarn('Failed to convert ROS Image without cv_bridge (encoding=%s)', getattr(msg, 'encoding', ''))
                 return
 
         # Save as JPEG
+        # Decide format based on extension
+        _, ext = os.path.splitext(self.save_path.lower())
         try:
-            ok = cv2.imwrite(self.save_path, cv_img, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+            if ext == '.png':
+                ok = cv2.imwrite(self.save_path, cv_img, [int(cv2.IMWRITE_PNG_COMPRESSION), 3])
+            else:
+                ok = cv2.imwrite(self.save_path, cv_img, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
             if not ok:
                 rospy.logwarn('Failed to write image to %s', self.save_path)
                 return
+            # Best-effort write to alternate locations if enabled
+            if self.extra_compat_writes:
+                try:
+                    os.makedirs(self.alt_data_dir, exist_ok=True)
+                    cv2.imwrite(self.alt_save_path, cv_img)
+                except Exception:
+                    pass
+                try:
+                    os.makedirs(self.alt2_data_dir, exist_ok=True)
+                    cv2.imwrite(self.alt2_save_path, cv_img)
+                except Exception:
+                    pass
         except Exception as e:
             rospy.logwarn('Exception writing image: %s', str(e))
             return
 
         self.last_save_time = now
-        rospy.loginfo('Saved image to %s; running detector...', self.save_path)
+        if self.extra_compat_writes:
+            rospy.loginfo('Saved image to %s (compat: %s, %s); running detector...', self.save_path, self.alt_save_path, self.alt2_save_path)
+        else:
+            rospy.loginfo('Saved image to %s; running detector...', self.save_path)
 
         # Run detector as a subprocess
         py = sys.executable or 'python3'
         cmd = [py, self.detector_script, self.save_path, '--model', self.model]
+        rospy.loginfo('Running detector command: %s', ' '.join(cmd))
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
             # Stream output to ROS log
@@ -94,3 +158,57 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+# ---------- Helpers ----------
+def _bytes_to_array(msg, channels):
+    # Handle row stride (step) potentially > width*channels
+    width = msg.width
+    height = msg.height
+    step = msg.step
+    buf = np.frombuffer(msg.data, dtype=np.uint8)
+    if step == width * channels:
+        return buf.reshape((height, width, channels))
+    # Otherwise, slice each row
+    arr = buf.reshape((height, step))
+    arr = arr[:, :width * channels]
+    return arr.reshape((height, width, channels))
+
+def _mono_bytes_to_array(msg):
+    width = msg.width
+    height = msg.height
+    step = msg.step
+    buf = np.frombuffer(msg.data, dtype=np.uint8)
+    if step == width:
+        return buf.reshape((height, width))
+    arr = buf.reshape((height, step))
+    return arr[:, :width]
+
+def _convert_encoding_to_bgr(img, encoding):
+    enc = (encoding or '').lower()
+    if enc in ('bgr8', 'bgr16'):
+        return img
+    if enc in ('rgb8', 'rgb16'):
+        return cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+    if enc in ('rgba8', 'bgra8'):
+        # Convert to BGR by dropping alpha
+        if enc.startswith('rgba'):
+            img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
+        else:
+            img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+        return img
+    if enc in ('mono8', '8uc1'):
+        return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    # Unknown: return as-is
+    return img
+
+def rosimg_to_cv2_bgr(msg):
+    enc = (msg.encoding or '').lower()
+    if enc in ('mono8', '8uc1'):
+        img = _mono_bytes_to_array(msg)
+        return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    # Assume 3-channel by default
+    img = _bytes_to_array(msg, 3)
+    return _convert_encoding_to_bgr(img, enc)
+
+# Bind as method of class for convenience
+CameraSaveAndDetect._rosimg_to_cv2 = staticmethod(rosimg_to_cv2_bgr)

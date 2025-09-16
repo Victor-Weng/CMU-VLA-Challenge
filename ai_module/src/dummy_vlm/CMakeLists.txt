@@ -43,5 +43,6 @@ add_dependencies(image_lidar_capture ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catki
 # Install Python scripts (ROS nodes)
 catkin_install_python(PROGRAMS
   scripts/camera_save_and_detect.py
+  scripts/paired_detect_and_depth.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
