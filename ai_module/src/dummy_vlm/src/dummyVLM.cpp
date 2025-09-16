@@ -265,59 +265,70 @@ void readObjectListFile()
 
 // Mistral API Function
 //  Callback for curl to write response data
-static size_t WriteCallback(void *contents, size_t size, size_t nmemb, void *userp)
-{
-  ((std::string *)userp)->append((char *)contents, size * nmemb);
-  return size * nmemb;
-}
-
-// Function to send a question to Mistral and get the response
 std::string askMistral(const std::string &question)
 {
-  std::string response;
+    std::string response;
 
-  CURL *curl = curl_easy_init();
-  if (!curl)
-  {
-    std::cerr << "Failed to initialize curl." << std::endl;
-    return "";
-  }
+    CURL *curl = curl_easy_init();
+    if (!curl)
+    {
+        std::cerr << "Failed to initialize curl." << std::endl;
+        return "";
+    }
 
-  std::string url = "https://api.mistral.ai/v1/chat/completions";
-  std::string payload = R"({"model":"mistral-large-latest","messages":[{"role":"user","content":")" + question + "\"}]}";
+    std::string url = "https://api.mistral.ai/v1/chat/completions";
 
-  struct curl_slist *headers = nullptr;
-  headers = curl_slist_append(headers, "Content-Type: application/json");
-  headers = curl_slist_append(headers, "Authorization: Bearer OFgLAX07gC1v65hDAfeU4AoZNI9ehcMa");
+    // Add your instructions here
+    std::string instructions = R"(You are going to be asked one of three types of questions and are provided a datasheet of information.  
+The datasheet provides the time, object name, x/y/z coordinates in space, and reference image in that order. Use it to answer the questions as accurately as possible.  
 
-  curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-  curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payload.c_str());
-  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
-  curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+The first question type is "Numerical" and it takes the form of a question like "How many blue chairs are between the table and the wall?" or "How many black trash cans are near the window?". You must go through the datasheet to find an integer value as the answer. Respond with only a singular integer, without extraneous information.  
 
-  CURLcode res = curl_easy_perform(curl);
-  if (res != CURLE_OK)
-  {
-    std::cerr << "Curl failed: " << curl_easy_strerror(res) << std::endl;
-    response = "";
-  }
+The second question type is "Object Reference" and it takes the form of a question like "Find the potted plant on the kitchen island that is closest to the fridge." or "Find the orange chair between the table and sink that is closest to the window.". You must go through the spreadsheet to find the unique object that most closely matches this description. Respond with only the image file corresponding to the correct object. Respond with only a single image file name, without extraneous information.  
 
-  curl_slist_free_all(headers);
-  curl_easy_cleanup(curl);
+The third question type is "Instruction-Following" and it takes the form of a question like "Take the path near the window to the fridge." or "Avoid the path between the two tables and go near the blue trash can near the window.". You start at (0,0). You can only move up, down, left, or right in this grid in single integer-valued squares. Write out the coordinates of the steps for you to accomplish the task provided. Provide only a sequence of coordinates in the form (x,y) - each on a new line.)";
 
-  // Parse JSON to get assistant content
-  try
-  {
-    auto j = json::parse(response);
-    return j["choices"][0]["message"]["content"];
-  }
-  catch (...)
-  {
-    std::cerr << "Failed to parse response." << std::endl;
-    return "";
-  }
+    std::string payload = R"({
+        "model":"mistral-large-latest",
+        "messages":[
+            {"role":"system","content":")" + instructions + R"("},
+            {"role":"user","content":")" + question + R"("}
+        ]
+    })";
+
+    struct curl_slist *headers = nullptr;
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+    headers = curl_slist_append(headers, "Authorization: Bearer OFgLAX07gC1v65hDAfeU4AoZNI9ehcMa");
+
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payload.c_str());
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+
+    CURLcode res = curl_easy_perform(curl);
+    if (res != CURLE_OK)
+    {
+        std::cerr << "Curl failed: " << curl_easy_strerror(res) << std::endl;
+        response = "";
+    }
+
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+
+    // Parse JSON to get assistant content
+    try
+    {
+        auto j = json::parse(response);
+        return j["choices"][0]["message"]["content"];
+    }
+    catch (...)
+    {
+        std::cerr << "Failed to parse response." << std::endl;
+        return "";
+    }
 }
+
 
 // handle navigator commands (to be replaced by LLM later)
 // Parse and execute simple nav commands
