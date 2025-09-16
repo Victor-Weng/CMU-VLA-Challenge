@@ -4,6 +4,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ros/ros.h>
+#include <cstdlib>   // for system()
+#include <cstdio>    // for popen()
+#include <memory>    // for unique_ptr
+#include <array>     // for buffer
+
 
 #include <nav_msgs/Odometry.h>
 #include <nav_msgs/OccupancyGrid.h>
@@ -378,6 +383,32 @@ bool handleNavCommand(const std::string &q, ros::Publisher &waypointPub, geometr
     return true;
   }
 
+
+
+
+std::string runPythonScript(const std::string &scriptPath)
+{
+    std::array<char, 128> buffer;
+    std::string result;
+
+    // Open a pipe to run Python
+    std::string cmd = "python3 " + scriptPath;
+    std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(cmd.c_str(), "r"), pclose);
+
+    if (!pipe)
+    {
+        std::cerr << "[ERROR] Failed to run Python script: " << scriptPath << std::endl;
+        return "";
+    }
+
+    while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr)
+    {
+        result += buffer.data();
+    }
+
+    return result;
+}
+
   // COMMAND: frontier control commands
   // "frontier start" -> enable bridging from /next_goal
   // "frontier stop"  -> disable bridging
@@ -513,6 +544,15 @@ bool handleNavCommand(const std::string &q, ros::Publisher &waypointPub, geometr
     waypointHeading = oldH;
     return true;
   }
+
+  
+  // Run Python script to compute 3D object coordinates
+  std::string pythonOutput = runPythonScript("../data/getting-3d-coords.py");
+  if (!pythonOutput.empty())
+  {
+    ROS_INFO("[Python] Output:\n%s", pythonOutput.c_str());
+  }
+
   // Mistral API
   // Print the mistral api output with ROS-INFO
 
