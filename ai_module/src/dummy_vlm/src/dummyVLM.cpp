@@ -55,6 +55,49 @@ static ros::Time g_lastMapTime;       // latest /map stamp observed (if we subsc
 static std::string g_mapFrame = "map";
 static std::string g_robotFrame = "base_link";
 
+// --- Stagnation detection & recovery state ---
+static geometry_msgs::Pose2D g_lastWp;         // last published waypoint
+static ros::Time g_lastWpStamp;                // time we last published any waypoint
+static geometry_msgs::Pose2D g_lastDistinctWp; // last waypoint that changed significantly
+static ros::Time g_lastDistinctStamp;          // time of the last distinct waypoint
+static float g_refX = 0.0f, g_refY = 0.0f;     // reference pose for movement window
+static ros::Time g_refStamp;                   // when ref pose was set
+static ros::Time g_lastRecovery;               // last time we triggered recovery
+static ros::Time g_recoveryHoldUntil;          // suppress bridging until this time
+// Recovery step state
+static int g_recoveryPhase = 0; // 0=idle, 1=backing, 2=turning
+static geometry_msgs::Pose2D g_recoveryBackupWp;
+static geometry_msgs::Pose2D g_recoveryTurnWp;
+static ros::Time g_recoveryStepDeadline;
+
+// Tunables (can be overridden via params)
+static double g_stagnationSec = 10.0;     // how long similar goals tolerated
+static double g_minGoalDelta = 0.20;      // meters; threshold to consider goals different
+static double g_minMove = 0.20;           // meters moved within window to consider progress
+static double g_recoveryCooldown = 10.0;  // seconds between recovery actions
+static double g_turnRadians = M_PI / 1.0; // 160 degrees left turn
+static double g_recoveryHoldSec = 3.0;    // seconds to suppress bridging after recovery
+// Back-up then turn parameters
+static double g_recoveryBackupDist = 0.30;  // meters to back up before turning
+static double g_recoveryStepWaitSec = 1.5;  // seconds to wait for backup step
+static double g_recoveryTurnWaitSec = 1.0;  // seconds to wait for the turn step
+static double g_recoveryReachThresh = 0.15; // meters to consider backup reached
+
+// Helper: record (and de-dup) waypoint events
+static inline void recordWaypoint(const geometry_msgs::Pose2D &wp)
+{
+  g_lastWp = wp;
+  g_lastWpStamp = ros::Time::now();
+  double dx = wp.x - g_lastDistinctWp.x;
+  double dy = wp.y - g_lastDistinctWp.y;
+  double d = std::sqrt(dx * dx + dy * dy);
+  if (g_lastDistinctStamp.isZero() || d >= g_minGoalDelta)
+  {
+    g_lastDistinctWp = wp;
+    g_lastDistinctStamp = g_lastWpStamp;
+  }
+}
+
 // forward declarations
 // Receives PoseStamped on /next_goal and republishes Pose2D to /way_point_with_heading
 void nextGoalCb(const geometry_msgs::PoseStamped::ConstPtr &msg);
@@ -73,6 +116,13 @@ void nextGoalCb(const geometry_msgs::PoseStamped::ConstPtr &msg)
   if (!g_frontierEnabled)
     return;
 
+  // Suppress bridging if a recovery just triggered and we want to hold the turn-in-place
+  if (!g_recoveryHoldUntil.isZero() && ros::Time::now() < g_recoveryHoldUntil)
+  {
+    ROS_INFO_THROTTLE(1.0, "Frontier bridge suppressed during recovery hold");
+    return;
+  }
+
   // Build a simple Pose2D from the incoming PoseStamped (map frame assumed)
   geometry_msgs::Pose2D out;
   out.x = msg->pose.position.x; // copy X in meters
@@ -83,6 +133,9 @@ void nextGoalCb(const geometry_msgs::PoseStamped::ConstPtr &msg)
   g_waypointPub.publish(out);
   g_lastNextGoal = ros::Time::now();
   g_lastBridgedGoal = g_lastNextGoal;
+
+  // Track for stagnation detection
+  recordWaypoint(out);
 
   // Log for visibility
   ROS_INFO("Frontier bridge: sent goal to /way_point_with_heading (%.2f, %.2f)", out.x, out.y);
@@ -379,6 +432,7 @@ void pubPathWaypoints(ros::Publisher &waypointPub, geometry_msgs::Pose2D &waypoi
   if (waypointPub.getNumSubscribers() == 0)
     ROS_WARN("No subscribers on /way_point_with_heading (planner not running?)");
   waypointPub.publish(waypointMsgs);
+  recordWaypoint(waypointMsgs);
 
   // Start timer for timeout handling
   ros::Time wpStart = ros::Time::now();
@@ -409,6 +463,7 @@ void pubPathWaypoints(ros::Publisher &waypointPub, geometry_msgs::Pose2D &waypoi
       waypointMsgs.y = waypointY[waypointID];
       waypointMsgs.theta = waypointHeading[waypointID];
       waypointPub.publish(waypointMsgs);
+      recordWaypoint(waypointMsgs);
       wpStart = ros::Time::now(); // reset timeout timer on advance
     }
 
@@ -423,6 +478,7 @@ void pubPathWaypoints(ros::Publisher &waypointPub, geometry_msgs::Pose2D &waypoi
       waypointMsgs.y = waypointY[waypointID];
       waypointMsgs.theta = waypointHeading[waypointID];
       waypointPub.publish(waypointMsgs);
+      recordWaypoint(waypointMsgs);
       wpStart = ros::Time::now();
     }
 
@@ -484,6 +540,12 @@ void poseHandler(const nav_msgs::Odometry::ConstPtr &pose)
   vehicleX = pose->pose.pose.position.x;
   vehicleY = pose->pose.pose.position.y;
   g_lastOdom = *pose;
+  if (g_refStamp.isZero())
+  {
+    g_refX = vehicleX;
+    g_refY = vehicleY;
+    g_refStamp = ros::Time::now();
+  }
   ROS_INFO_THROTTLE(1.0, "Odom x=%.2f y=%.2f (frame=%s child=%s)", vehicleX, vehicleY,
                     pose->header.frame_id.c_str(), pose->child_frame_id.c_str());
 }
@@ -504,7 +566,10 @@ void questionHandler(const std_msgs::String::ConstPtr &msg)
 void diagnosticsTimerCb(const ros::TimerEvent &)
 {
   if (!g_frontierEnabled)
-    return; // only chatty when frontier mode is on
+  {
+    // We still run stagnation recovery even if frontier is off when navigation is active.
+    // But keep logs quiet otherwise.
+  }
 
   ros::Time now = ros::Time::now();
 
@@ -558,6 +623,102 @@ void diagnosticsTimerCb(const ros::TimerEvent &)
   {
     ROS_WARN_THROTTLE(5.0, "No /next_goal bridged yet; is frontier_explorer running?");
   }
+
+  // --- Stagnation detection & recovery ---
+  bool navActive = g_frontierEnabled || (!g_lastWpStamp.isZero() && (now - g_lastWpStamp).toSec() < 5.0);
+  if (navActive)
+  {
+    // Goal similarity over time
+    bool goalsStagnant = (!g_lastDistinctStamp.isZero() && (now - g_lastDistinctStamp).toSec() > g_stagnationSec);
+
+    // Movement check in a sliding window
+    bool notMoving = false;
+    if (!g_refStamp.isZero() && (now - g_refStamp).toSec() > g_stagnationSec)
+    {
+      double dx = vehicleX - g_refX;
+      double dy = vehicleY - g_refY;
+      double moved = std::sqrt(dx * dx + dy * dy);
+      if (moved < g_minMove)
+        notMoving = true;
+      // reset window
+      g_refX = vehicleX;
+      g_refY = vehicleY;
+      g_refStamp = now;
+    }
+
+    // Start a recovery sequence if not already in one
+    if (g_recoveryPhase == 0 && (goalsStagnant || notMoving) && (g_lastRecovery.isZero() || (now - g_lastRecovery).toSec() > g_recoveryCooldown))
+    {
+      // Compute yaw from odometry
+      tf::Quaternion q;
+      tf::quaternionMsgToTF(g_lastOdom.pose.pose.orientation, q);
+      double roll, pitch, yaw;
+      tf::Matrix3x3(q).getRPY(roll, pitch, yaw);
+      double newYaw = yaw + g_turnRadians;
+      // normalize to [-pi, pi]
+      while (newYaw > M_PI)
+        newYaw -= 2.0 * M_PI;
+      while (newYaw < -M_PI)
+        newYaw += 2.0 * M_PI;
+      // Step 1: compute and publish a backup waypoint behind the robot
+      g_recoveryBackupWp.x = vehicleX - g_recoveryBackupDist * std::cos(yaw);
+      g_recoveryBackupWp.y = vehicleY - g_recoveryBackupDist * std::sin(yaw);
+      g_recoveryBackupWp.theta = static_cast<float>(yaw); // keep current heading while backing up
+
+      // Step 2: turn in place at the backed-up position
+      g_recoveryTurnWp.x = g_recoveryBackupWp.x;
+      g_recoveryTurnWp.y = g_recoveryBackupWp.y;
+      g_recoveryTurnWp.theta = static_cast<float>(newYaw);
+
+      // Start the recovery sequence with backing up
+      g_recoveryPhase = 1;
+      g_recoveryStepDeadline = now + ros::Duration(g_recoveryStepWaitSec);
+      // Hold bridging long enough to perform the backup step
+      g_recoveryHoldUntil = now + ros::Duration(std::max(g_recoveryHoldSec, g_recoveryStepWaitSec));
+
+      ROS_WARN("Recovery: detected %s; backing up %.2fm then turning left to theta=%.2f rad",
+               goalsStagnant && notMoving ? "stagnant goals and no movement"
+                                          : (goalsStagnant ? "stagnant goals" : "no movement"),
+               g_recoveryBackupDist, newYaw);
+      ROS_INFO("Step 1/2: publish backup waypoint (%.2f, %.2f); suppressing bridge for %.1fs",
+               g_recoveryBackupWp.x, g_recoveryBackupWp.y,
+               (g_recoveryHoldUntil - now).toSec());
+      g_waypointPub.publish(g_recoveryBackupWp);
+      recordWaypoint(g_recoveryBackupWp);
+      g_lastRecovery = now;
+    }
+
+    // Drive recovery sequence steps
+    if (g_recoveryPhase == 1)
+    {
+      // Check if backup reached or deadline passed
+      double dx = vehicleX - g_recoveryBackupWp.x;
+      double dy = vehicleY - g_recoveryBackupWp.y;
+      double dist = std::sqrt(dx * dx + dy * dy);
+      if (dist < g_recoveryReachThresh || now >= g_recoveryStepDeadline)
+      {
+        // Proceed to turning step
+        g_recoveryPhase = 2;
+        g_recoveryStepDeadline = now + ros::Duration(g_recoveryTurnWaitSec);
+        // Extend hold to cover turn step
+        if (g_recoveryHoldUntil < g_recoveryStepDeadline)
+          g_recoveryHoldUntil = g_recoveryStepDeadline;
+        ROS_INFO("Step 2/2: publish turn-in-place waypoint theta=%.2f; holding bridge for %.1fs",
+                 g_recoveryTurnWp.theta, (g_recoveryHoldUntil - now).toSec());
+        g_waypointPub.publish(g_recoveryTurnWp);
+        recordWaypoint(g_recoveryTurnWp);
+      }
+    }
+    else if (g_recoveryPhase == 2)
+    {
+      // Finish recovery after turn wait window
+      if (now >= g_recoveryStepDeadline)
+      {
+        g_recoveryPhase = 0; // done
+        ROS_INFO("Recovery sequence completed");
+      }
+    }
+  }
 }
 
 int main(int argc, char **argv)
@@ -571,6 +732,16 @@ int main(int argc, char **argv)
   nhPrivate.getParam("waypointReachDis", waypointReachDis);
   nhPrivate.getParam("map_frame", g_mapFrame);
   nhPrivate.getParam("robot_frame", g_robotFrame);
+  nhPrivate.param("stagnation_time", g_stagnationSec, g_stagnationSec);
+  nhPrivate.param("min_goal_delta", g_minGoalDelta, g_minGoalDelta);
+  nhPrivate.param("min_movement", g_minMove, g_minMove);
+  nhPrivate.param("recovery_cooldown", g_recoveryCooldown, g_recoveryCooldown);
+  nhPrivate.param("turn_radians", g_turnRadians, g_turnRadians);
+  nhPrivate.param("recovery_hold_sec", g_recoveryHoldSec, g_recoveryHoldSec);
+  nhPrivate.param("recovery_backup_dist", g_recoveryBackupDist, g_recoveryBackupDist);
+  nhPrivate.param("recovery_step_wait_sec", g_recoveryStepWaitSec, g_recoveryStepWaitSec);
+  nhPrivate.param("recovery_turn_wait_sec", g_recoveryTurnWaitSec, g_recoveryTurnWaitSec);
+  nhPrivate.param("recovery_reach_thresh", g_recoveryReachThresh, g_recoveryReachThresh);
 
   ros::Subscriber subPose = nh.subscribe<nav_msgs::Odometry>("/state_estimation", 5, poseHandler);
 

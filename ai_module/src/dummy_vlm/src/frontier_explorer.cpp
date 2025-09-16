@@ -1,69 +1,55 @@
-#include <ros/ros.h>                   // ros lib
-#include <nav_msgs/OccupancyGrid.h>    // occupancy grid
-#include <geometry_msgs/PoseStamped.h> // to publish next goal (pos + header)
-#include <geometry_msgs/Point.h>       // store cell coordinates in frontier structs
-#include <tf/transform_listener.h>     // TF Listener to query the robot pose
-#include <nav_msgs/Odometry.h>         // optional odom fallback for robot pose
-// Include standard headers for utilities (vectors, queues, limits).
+// ROS
+#include <ros/ros.h>
+#include <nav_msgs/OccupancyGrid.h>
+#include <nav_msgs/Odometry.h>
+#include <geometry_msgs/PoseStamped.h>
+#include <geometry_msgs/Point.h>
+#include <tf/transform_listener.h>
+
+// STL
 #include <vector>
 #include <queue>
-#include <limits>
-#include <cmath>
+#include <deque>
 #include <string>
 #include <algorithm>
+#include <limits>
+#include <cmath>
+#include <random>
 
+using std::deque;
 using std::queue;
-using std::size_t;
 using std::string;
 using std::vector;
 
-// define struct for a frontier
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 struct Frontier
 {
-    // list of cells in this frontier
     vector<geometry_msgs::Point> cells;
-    // Centroid of the frontier in world coordinates, avg of cell points
     geometry_msgs::Point centroid;
-    // size as area = cell_count*res^2
-    double size;
+    double size; // approx area in m^2
 };
 
-// convert 2D grid indices of row,col into a flat array index
-// grind cells stored in OccupancyGrid::data as a 1D vector of int8_t
-inline int idx(int row, int col, int width)
-{ // inline makes global var safe
-    // linear index = row*width + col
-    return row * width + col;
-}
+inline int idx(int row, int col, int width) { return row * width + col; }
 
-// class for frontier detection, clustering, and goal selection logic
 class FrontierExplorer
 {
-public: // accessible outside the class
-    // constructor: set up ROS interfaces and parameters
+public:
     FrontierExplorer(ros::NodeHandle &nh, ros::NodeHandle &pnh)
-        : nh_(nh), pnh_(pnh),
-          tf_listener_(),                         // transform frames from camera and lidar to our map
-          have_map_(false),                       // no map by default
-          map_frame_("map"),                      // default map frame name
-          robot_frame_("base_link"),              // default robot frame name
-          robot_pose_topic_("/state_estimation"), // default odom topic name
-          free_threshold_(20),                    // occupancy <= 20 = free, change this later
-          occ_threshold_(65),                     // >= 65 = occupied
-          min_frontier_cells_(10),                // minimum cluster size to consider a valid frontier
-          goal_topic_("/next_goal"),              // topic to publish PoseStamped goals
-          map_topic_("/map"),                     // topic to subscribe for occupany grid
-          fallback_enabled_(true),                // allow fallback when no map is available
-          fb_angle_(0.0),
-          fb_radius_(1.0),
-          fb_radius_max_(5.0),
-          fb_angle_step_(M_PI / 6.0), // 30 degrees per tick
-          fb_radius_step_(0.2),       // expand radius slowly
-          robot_radius_(0.30),        // meters, approximate
-          safety_margin_(0.20)        // meters, extra clearance
+        : nh_(nh), pnh_(pnh), tf_listener_(), have_map_(false),
+          map_frame_("map"), robot_frame_("base_link"), goal_topic_("/next_goal"), map_topic_("/map"), robot_pose_topic_("/state_estimation"),
+          free_threshold_(20), occ_threshold_(65), min_frontier_cells_(10),
+          fallback_enabled_(true), fb_angle_(0.0), fb_radius_(1.0), fb_radius_max_(5.0), fb_angle_step_(M_PI / 6.0), fb_radius_step_(0.2),
+          robot_radius_(0.30), safety_margin_(0.20),
+          min_goal_dist_m_(1.0), min_publish_separation_m_(0.5), min_publish_period_s_(1.5),
+          unknown_radius_m_(2.0), weight_unknown_(1.0), weight_distance_(0.2),
+          current_goal_active_(false),
+          switch_improvement_(5.0), goal_timeout_s_(25.0), progress_window_s_(6.0), min_progress_m_(0.30),
+          recent_goal_block_s_(12.0), recent_goal_radius_m_(0.6),
+          random_step_m_(1.0), random_trials_(8), temp_hold_s_(3.0), temp_goal_active_(false)
     {
-        // Allow overriding defaults via private parameters (from launch file / param server)
         pnh_.param<string>("map_frame", map_frame_, map_frame_);
         pnh_.param<string>("robot_frame", robot_frame_, robot_frame_);
         pnh_.param<string>("robot_pose_topic", robot_pose_topic_, robot_pose_topic_);
@@ -76,44 +62,57 @@ public: // accessible outside the class
         pnh_.param<double>("fallback_radius_max", fb_radius_max_, fb_radius_max_);
         pnh_.param<double>("robot_radius", robot_radius_, robot_radius_);
         pnh_.param<double>("safety_margin", safety_margin_, safety_margin_);
+        pnh_.param<double>("min_goal_dist", min_goal_dist_m_, min_goal_dist_m_);
+        pnh_.param<double>("min_publish_separation", min_publish_separation_m_, min_publish_separation_m_);
+        pnh_.param<double>("min_publish_period", min_publish_period_s_, min_publish_period_s_);
+        pnh_.param<double>("unknown_radius", unknown_radius_m_, unknown_radius_m_);
+        pnh_.param<double>("weight_unknown", weight_unknown_, weight_unknown_);
+        pnh_.param<double>("weight_distance", weight_distance_, weight_distance_);
+        pnh_.param<double>("switch_improvement", switch_improvement_, switch_improvement_);
+        pnh_.param<double>("goal_timeout", goal_timeout_s_, goal_timeout_s_);
+        pnh_.param<double>("progress_window", progress_window_s_, progress_window_s_);
+        pnh_.param<double>("min_progress", min_progress_m_, min_progress_m_);
+        pnh_.param<double>("recent_goal_block_s", recent_goal_block_s_, recent_goal_block_s_);
+        pnh_.param<double>("recent_goal_radius_m", recent_goal_radius_m_, recent_goal_radius_m_);
+        pnh_.param<double>("random_step_m", random_step_m_, random_step_m_);
+        pnh_.param<int>("random_trials", random_trials_, random_trials_);
+        pnh_.param<double>("random_hold_s", temp_hold_s_, temp_hold_s_);
 
-        // Subscribe to the occupancy grid map; queue size 1 since we only need the latest map.
-        map_sub_ = nh_.subscribe<nav_msgs::OccupancyGrid>(
-            map_topic_, 1, &FrontierExplorer::mapCallback, this);
-
-        // Subscribe to odometry as a fallback pose source
-        odom_sub_ = nh_.subscribe<nav_msgs::Odometry>(
-            robot_pose_topic_, 1, &FrontierExplorer::odomCallback, this);
-
-        // Advertise the next-goal topic where we publish the selected frontier as a PoseStamped.
+        map_sub_ = nh_.subscribe<nav_msgs::OccupancyGrid>(map_topic_, 1, &FrontierExplorer::mapCallback, this);
+        odom_sub_ = nh_.subscribe<nav_msgs::Odometry>(robot_pose_topic_, 1, &FrontierExplorer::odomCallback, this);
         goal_pub_ = nh_.advertise<geometry_msgs::PoseStamped>(goal_topic_, 1);
-
-        // Create a periodic timer to run the frontier pipeline at a fixed frequency (e.g., 1 Hz).
         timer_ = nh_.createTimer(ros::Duration(1.0), &FrontierExplorer::onTimer, this);
 
-        // Log configuration so the operator knows what frames and thresholds are active.
+        rng_.seed(static_cast<unsigned>(ros::Time::now().toNSec() & 0xffffffffu));
+
         ROS_INFO("FrontierExplorer: map_frame=%s robot_frame=%s map_topic=%s goal_topic=%s",
                  map_frame_.c_str(), robot_frame_.c_str(), map_topic_.c_str(), goal_topic_.c_str());
     }
 
 private:
-    // Odometry callback to cache a recent robot pose as a TF fallback
-    void odomCallback(const nav_msgs::Odometry::ConstPtr &msg)
-    {
-        last_odom_ = *msg;
-    }
-    // Callback when a new map (OccupancyGrid) message arrives.
+    // Callbacks
+    void odomCallback(const nav_msgs::Odometry::ConstPtr &msg) { last_odom_ = *msg; }
     void mapCallback(const nav_msgs::OccupancyGrid::ConstPtr &msg)
     {
-        // Store the received map message (copy) so we can process it in the timer callback.
         latest_map_ = *msg;
-        // Mark that we now have at least one valid map.
         have_map_ = true;
     }
-    // Timer callback executed periodically to detect frontiers and publish a goal.
+
     void onTimer(const ros::TimerEvent &)
     {
-        // If we have no map yet, optionally run a simple TF-based fallback exploration
+        // Keep publishing temp random goal briefly
+        if (temp_goal_active_)
+        {
+            if (ros::Time::now() < temp_goal_until_)
+            {
+                if (shouldPublish(temp_goal_))
+                    publishTempGoal(temp_goal_);
+                return;
+            }
+            temp_goal_active_ = false;
+        }
+
+        // No map yet? Fallback circle exploration using TF pose
         if (!have_map_)
         {
             if (!fallback_enabled_)
@@ -121,14 +120,12 @@ private:
                 ROS_WARN_THROTTLE(5.0, "FrontierExplorer: waiting for map on %s", map_topic_.c_str());
                 return;
             }
-            double rx = 0.0, ry = 0.0, ryaw = 0.0;
-            if (!getRobotPose(rx, ry, ryaw))
+            double rx = 0, ry = 0, yaw = 0;
+            if (!getRobotPose(rx, ry, yaw))
             {
-                ROS_WARN_THROTTLE(2.0, "FrontierExplorer: fallback waiting for TF (%s -> %s)",
-                                  map_frame_.c_str(), robot_frame_.c_str());
+                ROS_WARN_THROTTLE(2.0, "FrontierExplorer: fallback waiting for TF (%s -> %s)", map_frame_.c_str(), robot_frame_.c_str());
                 return;
             }
-            // publish a goal along a growing circle around the robot
             geometry_msgs::Point p;
             p.x = rx + fb_radius_ * std::cos(fb_angle_);
             p.y = ry + fb_radius_ * std::sin(fb_angle_);
@@ -137,62 +134,122 @@ private:
             fb_angle_ += fb_angle_step_;
             if (fb_angle_ > 2.0 * M_PI)
                 fb_angle_ -= 2.0 * M_PI;
-            // slowly expand radius up to max
             fb_radius_ = std::min(fb_radius_ + fb_radius_step_, fb_radius_max_);
-            ROS_INFO_THROTTLE(2.0, "FrontierExplorer(fallback): publishing exploratory goal (r=%.1f)", fb_radius_);
+            ROS_INFO_THROTTLE(2.0, "FrontierExplorer(fallback): exploratory goal r=%.1f", fb_radius_);
             return;
         }
 
-        // Attempt to get the current robot pose in the map frame.
-        double rx = 0.0, ry = 0.0, ryaw = 0.0;
-        if (!getRobotPose(rx, ry, ryaw))
+        // Get robot pose
+        double rx = 0, ry = 0, yaw = 0;
+        if (!getRobotPose(rx, ry, yaw))
         {
-            // If pose lookup fails (e.g., TF not ready), skip this cycle.
-            ROS_WARN_THROTTLE(2.0, "FrontierExplorer: could not get robot pose (%s -> %s)",
-                              map_frame_.c_str(), robot_frame_.c_str());
+            ROS_WARN_THROTTLE(2.0, "FrontierExplorer: could not get robot pose (%s -> %s)", map_frame_.c_str(), robot_frame_.c_str());
             return;
         }
 
-        // Run frontier detection to get a vector of individual frontier cell coordinates (world frame).
+        // Detect and cluster frontiers
         vector<geometry_msgs::Point> frontier_cells = detectFrontiers(latest_map_);
-
-        // Cluster the frontier cells into connected regions (frontiers) using BFS/DFS.
         vector<Frontier> frontiers = clusterFrontiers(latest_map_, frontier_cells);
-
-        // If no usable frontiers were found, log and return.
         if (frontiers.empty())
         {
-            ROS_WARN_THROTTLE(2.0, "FrontierExplorer: no frontiers detected");
+            ROS_WARN_THROTTLE(2.0, "FrontierExplorer: no frontiers; trying random exploration");
+            geometry_msgs::Point rp;
+            if (computeRandomGoal(latest_map_, rx, ry, rp))
+            {
+                temp_goal_ = rp;
+                temp_goal_until_ = ros::Time::now() + ros::Duration(temp_hold_s_);
+                temp_goal_active_ = true;
+                publishTempGoal(temp_goal_);
+            }
             return;
         }
 
-        // Select the best frontier (closest centroid to robot in Euclidean distance).
-        Frontier best = selectBestFrontier(frontiers, rx, ry);
+        // Choose a goal
+        geometry_msgs::Point goal;
+        bool ok = selectGoal(latest_map_, frontiers, rx, ry, goal);
+        if (!ok)
+        {
+            ROS_WARN_THROTTLE(2.0, "FrontierExplorer: no suitable frontier goal; trying random exploration");
+            geometry_msgs::Point rp;
+            if (computeRandomGoal(latest_map_, rx, ry, rp))
+            {
+                temp_goal_ = rp;
+                temp_goal_until_ = ros::Time::now() + ros::Duration(temp_hold_s_);
+                temp_goal_active_ = true;
+                publishTempGoal(temp_goal_);
+            }
+            return;
+        }
 
-        // Choose a safe goal within the selected frontier (with clearance), else back off.
-        geometry_msgs::Point goal = chooseSafeGoal(latest_map_, best, rx, ry);
-        publishGoal(goal);
+        // If no current goal, set and publish
+        if (!current_goal_active_)
+        {
+            setCurrentGoal(goal, rx, ry, latest_map_);
+            publishGoal(goal);
+            return;
+        }
+
+        // Commitment and progress checks
+        double now_s = ros::Time::now().toSec();
+        bool timeout = (now_s - current_goal_time_.toSec()) > goal_timeout_s_;
+        bool no_progress = false;
+        if ((now_s - last_progress_check_.toSec()) > progress_window_s_)
+        {
+            double dist_now = std::hypot(current_goal_.x - rx, current_goal_.y - ry);
+            if ((last_progress_dist_ - dist_now) < min_progress_m_)
+                no_progress = true;
+            last_progress_dist_ = dist_now;
+            last_progress_check_ = ros::Time::now();
+        }
+
+        double cand_score = scorePoint(latest_map_, rx, ry, goal);
+        double curr_score = scorePoint(latest_map_, rx, ry, current_goal_);
+        bool significantly_better = (cand_score + switch_improvement_) < curr_score;
+
+        if (timeout || no_progress || significantly_better)
+        {
+            if (isRecentlyUsed(goal))
+            {
+                ROS_INFO_THROTTLE(2.0, "FrontierExplorer: candidate near recent goal; publishing random temp goal");
+                geometry_msgs::Point rp;
+                if (computeRandomGoal(latest_map_, rx, ry, rp))
+                {
+                    temp_goal_ = rp;
+                    temp_goal_until_ = ros::Time::now() + ros::Duration(temp_hold_s_);
+                    temp_goal_active_ = true;
+                    publishTempGoal(temp_goal_);
+                    return;
+                }
+            }
+            else
+            {
+                setCurrentGoal(goal, rx, ry, latest_map_);
+                publishGoal(goal);
+                return;
+            }
+        }
+
+        if (!shouldPublish(current_goal_))
+        {
+            ROS_INFO_THROTTLE(2.0, "FrontierExplorer: keeping current goal (stable)");
+            return;
+        }
+        publishGoal(current_goal_);
     }
 
-    // Look up the robot pose (x, y, yaw) in the map frame using TF.
     bool getRobotPose(double &x, double &y, double &yaw)
     {
-        // Define the source and target frames for the transform.
         const string &target_frame = map_frame_;
         const string &source_frame = robot_frame_;
-        // Create a stamped transform object to receive the transform data.
         tf::StampedTransform transform;
         try
         {
-            // Wait up to 0.2 seconds for the transform to become available.
             tf_listener_.waitForTransform(target_frame, source_frame, ros::Time(0), ros::Duration(0.2));
-            // Retrieve the latest available transform from source_frame to target_frame.
             tf_listener_.lookupTransform(target_frame, source_frame, ros::Time(0), transform);
         }
         catch (const tf::TransformException &ex)
         {
-            // First, try common alternative robot frames before giving up.
-            std::vector<string> candidates = {robot_frame_, string("base_link"), string("base_footprint"), string("base")};
+            vector<string> candidates = {robot_frame_, string("base_link"), string("base_footprint"), string("base")};
             bool tf_ok = false;
             for (const auto &cand : candidates)
             {
@@ -203,23 +260,21 @@ private:
                     if (cand != robot_frame_)
                     {
                         ROS_WARN("FrontierExplorer: using alternative robot_frame '%s' (param was '%s')", cand.c_str(), robot_frame_.c_str());
-                        robot_frame_ = cand; // remember for next time
+                        robot_frame_ = cand;
                     }
                     tf_ok = true;
                     break;
                 }
                 catch (const tf::TransformException &)
                 {
-                    // try next
                 }
             }
             if (!tf_ok)
             {
-                // TF failed. Try odometry fallback if frames are consistent with map_frame.
                 ROS_WARN("TF lookup failed: %s", ex.what());
                 if (!last_odom_.header.frame_id.empty())
                 {
-                    const std::string &odom_frame = last_odom_.header.frame_id;
+                    const string &odom_frame = last_odom_.header.frame_id;
                     if (odom_frame == map_frame_ || (!latest_map_.header.frame_id.empty() && odom_frame == latest_map_.header.frame_id))
                     {
                         x = last_odom_.pose.pose.position.x;
@@ -231,193 +286,113 @@ private:
                         ROS_INFO_THROTTLE(2.0, "FrontierExplorer: using Odometry pose (frame=%s) as fallback", odom_frame.c_str());
                         return true;
                     }
-                    else
-                    {
-                        ROS_WARN_THROTTLE(2.0,
-                                          "FrontierExplorer: odom frame (%s) != map_frame (%s). Set param robot_frame to a valid TF child (e.g., base_link/base_footprint) or set map_frame to odom frame, or provide a static transform.",
-                                          odom_frame.c_str(), map_frame_.c_str());
-                    }
                 }
                 return false;
             }
-            // else: we have a transform in 'transform' from an alternative frame. Continue below to extract pose.
         }
-        // Extract translation (x, y) from the transform origin.
         x = transform.getOrigin().x();
         y = transform.getOrigin().y();
-        // Extract yaw (rotation about Z) from the quaternion.
         double roll, pitch;
         tf::Matrix3x3(transform.getRotation()).getRPY(roll, pitch, yaw);
-        // Return success.
         return true;
     }
 
-    // Detect individual frontier cells in the map and return them as world-frame points.
     vector<geometry_msgs::Point> detectFrontiers(const nav_msgs::OccupancyGrid &map)
     {
-        // Prepare an output vector to accumulate frontier points.
         vector<geometry_msgs::Point> cells;
-        // Cache map metadata for convenience.
-        const int width = static_cast<int>(map.info.width);   // number of columns
-        const int height = static_cast<int>(map.info.height); // number of rows
-        const double res = map.info.resolution;               // cell resolution (meters per cell)
-        const double ox = map.info.origin.position.x;         // world origin x (map frame)
-        const double oy = map.info.origin.position.y;         // world origin y (map frame)
-
-        // Lambda that checks whether a grid coordinate is inside bounds.
-        auto inBounds = [&](int r, int c) -> bool
-        {
-            // Valid rows: [0, height), valid cols: [0, width).
-            return (r >= 0 && r < height && c >= 0 && c < width);
-        };
-
-        // Iterate over every grid cell to test if it’s a frontier.
-        for (int r = 0; r < height; ++r)
-        {
-            for (int c = 0; c < width; ++c)
-            {
-                // Read the occupancy value at (r, c). Values: -1 unknown, 0 free, 100 occupied (or scaled).
-                int8_t occ = map.data[idx(r, c, width)];
-                // Frontier rule prerequisite: current cell must be "free enough".
-                if (occ < 0 || occ > free_threshold_)
-                {
-                    // Skip unknown or not-free cells.
-                    continue;
-                }
-                // Check the 8-neighborhood for at least one unknown neighbor.
-                bool adjacent_to_unknown = false;
-                for (int dr = -1; dr <= 1 && !adjacent_to_unknown; ++dr)
-                {
-                    for (int dc = -1; dc <= 1 && !adjacent_to_unknown; ++dc)
-                    {
-                        // Skip the center cell itself (dr=0, dc=0).
-                        if (dr == 0 && dc == 0)
-                            continue;
-                        // Compute neighbor row and column.
-                        int nr = r + dr;
-                        int nc = c + dc;
-                        // Only consider neighbors inside bounds.
-                        if (!inBounds(nr, nc))
-                            continue;
-                        // If a neighbor is unknown (< 0), current free cell is a frontier cell.
-                        if (map.data[idx(nr, nc, width)] < 0)
-                        {
-                            adjacent_to_unknown = true;
-                        }
-                    }
-                }
-                // If not adjacent to unknown, this free cell is not a frontier; continue.
-                if (!adjacent_to_unknown)
-                    continue;
-
-                // Convert this grid cell to world coordinates at cell center:
-                // world_x = ox + (c + 0.5) * res, world_y = oy + (r + 0.5) * res.
-                geometry_msgs::Point p;
-                p.x = ox + (static_cast<double>(c) + 0.5) * res;
-                p.y = oy + (static_cast<double>(r) + 0.5) * res;
-                p.z = 0.0; // 2D map, z = 0
-                // Append to the list of frontier cells.
-                cells.push_back(p);
-            }
-        }
-        // Return the collected frontier cells in world frame.
-        return cells;
-    }
-
-    // Cluster the frontier cells into connected components (frontiers) using BFS connectivity.
-    vector<Frontier> clusterFrontiers(const nav_msgs::OccupancyGrid &map,
-                                      const vector<geometry_msgs::Point> &cells_world)
-    {
-        // Prepare output vector for clusters (frontiers).
-        vector<Frontier> clusters;
-        // Quick exit: if no cells, return empty.
-        if (cells_world.empty())
-            return clusters;
-
-        // We'll need to map world points back to grid coords to perform connectivity on the grid.
-        // Cache map metadata for conversions.
         const int width = static_cast<int>(map.info.width);
         const int height = static_cast<int>(map.info.height);
         const double res = map.info.resolution;
         const double ox = map.info.origin.position.x;
         const double oy = map.info.origin.position.y;
 
-        // Frontier mask grid: mark which cells are frontier (1) vs not (0).
-        vector<uint8_t> is_frontier(static_cast<size_t>(width * height), 0);
-        // For each world point in cells_world, mark the corresponding grid cell as frontier.
-        for (const auto &wp : cells_world)
-        {
-            // Convert world coords back to integer grid indices: col = floor((x - ox)/res), row similarly.
-            int c = static_cast<int>(std::floor((wp.x - ox) / res));
-            int r = static_cast<int>(std::floor((wp.y - oy) / res));
-            // Bounds check to be safe.
-            if (r >= 0 && r < height && c >= 0 && c < width)
-            {
-                is_frontier[idx(r, c, width)] = 1;
-            }
-        }
-
-        // Visited mask to avoid reprocessing cells during BFS.
-        vector<uint8_t> visited(static_cast<size_t>(width * height), 0);
-
-        // Lambda to test in-bounds grid coordinates.
-        auto inBounds = [&](int r, int c) -> bool
-        {
-            return (r >= 0 && r < height && c >= 0 && c < width);
-        };
-
-        // Iterate over all grid cells; when we find an unvisited frontier cell, grow a cluster from it.
+        auto inBounds = [&](int r, int c)
+        { return (r >= 0 && r < height && c >= 0 && c < width); };
         for (int r = 0; r < height; ++r)
         {
             for (int c = 0; c < width; ++c)
             {
-                // Skip if not a frontier cell or already visited.
+                int8_t occ = map.data[idx(r, c, width)];
+                if (occ < 0 || occ > free_threshold_)
+                    continue;
+                bool adjacent_to_unknown = false;
+                for (int dr = -1; dr <= 1 && !adjacent_to_unknown; ++dr)
+                {
+                    for (int dc = -1; dc <= 1 && !adjacent_to_unknown; ++dc)
+                    {
+                        if (dr == 0 && dc == 0)
+                            continue;
+                        int nr = r + dr, nc = c + dc;
+                        if (!inBounds(nr, nc))
+                            continue;
+                        if (map.data[idx(nr, nc, width)] < 0)
+                            adjacent_to_unknown = true;
+                    }
+                }
+                if (!adjacent_to_unknown)
+                    continue;
+                geometry_msgs::Point p;
+                p.x = ox + (static_cast<double>(c) + 0.5) * res;
+                p.y = oy + (static_cast<double>(r) + 0.5) * res;
+                p.z = 0.0;
+                cells.push_back(p);
+            }
+        }
+        return cells;
+    }
+
+    vector<Frontier> clusterFrontiers(const nav_msgs::OccupancyGrid &map, const vector<geometry_msgs::Point> &cells_world)
+    {
+        vector<Frontier> clusters;
+        if (cells_world.empty())
+            return clusters;
+        const int width = static_cast<int>(map.info.width);
+        const int height = static_cast<int>(map.info.height);
+        const double res = map.info.resolution;
+        const double ox = map.info.origin.position.x;
+        const double oy = map.info.origin.position.y;
+        vector<uint8_t> is_frontier(static_cast<size_t>(width * height), 0);
+        for (const auto &wp : cells_world)
+        {
+            int c = static_cast<int>(std::floor((wp.x - ox) / res));
+            int r = static_cast<int>(std::floor((wp.y - oy) / res));
+            if (r >= 0 && r < height && c >= 0 && c < width)
+                is_frontier[idx(r, c, width)] = 1;
+        }
+        vector<uint8_t> visited(static_cast<size_t>(width * height), 0);
+        auto inBounds = [&](int r, int c)
+        { return (r >= 0 && r < height && c >= 0 && c < width); };
+        for (int r = 0; r < height; ++r)
+        {
+            for (int c = 0; c < width; ++c)
+            {
                 int linear = idx(r, c, width);
                 if (!is_frontier[linear] || visited[linear])
                     continue;
-
-                // Start a BFS from (r, c) to gather all connected frontier cells (8-connectivity).
                 queue<std::pair<int, int> > q;
                 q.push({r, c});
                 visited[linear] = 1;
-
-                // Accumulate cells (in world coords) into this cluster.
                 vector<geometry_msgs::Point> cluster_cells;
-
-                // Run BFS until the queue is empty.
                 while (!q.empty())
                 {
-                    // Pop the front cell from the queue.
                     auto rc = q.front();
                     q.pop();
-                    // Extract row and col of the current cell.
-                    int cr = rc.first;
-                    int cc = rc.second;
-
-                    // Convert current grid cell to world coordinates (cell center) and store in cluster.
+                    int cr = rc.first, cc = rc.second;
                     geometry_msgs::Point wp;
                     wp.x = ox + (static_cast<double>(cc) + 0.5) * res;
                     wp.y = oy + (static_cast<double>(cr) + 0.5) * res;
                     wp.z = 0.0;
                     cluster_cells.push_back(wp);
-
-                    // Explore 8-connected neighbors to grow the cluster.
                     for (int dr = -1; dr <= 1; ++dr)
                     {
                         for (int dc = -1; dc <= 1; ++dc)
                         {
-                            // Skip center.
                             if (dr == 0 && dc == 0)
                                 continue;
-                            // Neighbor coordinates.
-                            int nr = cr + dr;
-                            int nc = cc + dc;
-                            // Bounds check.
+                            int nr = cr + dr, nc = cc + dc;
                             if (!inBounds(nr, nc))
                                 continue;
-                            // Compute linear index.
                             int nlin = idx(nr, nc, width);
-                            // Enqueue neighbor if it is an unvisited frontier cell.
                             if (is_frontier[nlin] && !visited[nlin])
                             {
                                 visited[nlin] = 1;
@@ -425,65 +400,29 @@ private:
                             }
                         }
                     }
-                } // end BFS
-
-                // If the cluster is large enough, compute centroid and size and add it to the list.
+                }
                 if (static_cast<int>(cluster_cells.size()) >= min_frontier_cells_)
                 {
                     Frontier f;
                     f.cells = std::move(cluster_cells);
-                    // Compute centroid by averaging all world points in the cluster.
-                    double sx = 0.0, sy = 0.0;
+                    double sx = 0, sy = 0;
                     for (const auto &p : f.cells)
                     {
                         sx += p.x;
                         sy += p.y;
                     }
-                    const double inv_n = 1.0 / static_cast<double>(f.cells.size());
+                    double inv_n = 1.0 / static_cast<double>(f.cells.size());
                     f.centroid.x = sx * inv_n;
                     f.centroid.y = sy * inv_n;
                     f.centroid.z = 0.0;
-                    // Define size as physical area covered by frontier cells (approx cell_count * res^2).
                     f.size = static_cast<double>(f.cells.size()) * (res * res);
-                    // Append this frontier cluster to the output list.
                     clusters.push_back(std::move(f));
                 }
-                // Else (cluster too small), discard it silently.
             }
         }
-
-        // Return all detected frontier clusters.
         return clusters;
     }
 
-    // Choose the best frontier: here we pick the centroid closest to the robot.
-    Frontier selectBestFrontier(const vector<Frontier> &frontiers, double rx, double ry)
-    {
-        // Initialize best index and best distance with sentinel values.
-        int best_idx = -1;
-        double best_dist = std::numeric_limits<double>::infinity();
-        // Iterate over all frontiers and compute robot-to-centroid distance.
-        for (int i = 0; i < static_cast<int>(frontiers.size()); ++i)
-        {
-            const auto &c = frontiers[i].centroid;
-            const double dx = c.x - rx;
-            const double dy = c.y - ry;
-            const double d2 = dx * dx + dy * dy; // squared distance (avoids sqrt)
-            // Keep the smallest distance encountered.
-            if (d2 < best_dist)
-            {
-                best_dist = d2;
-                best_idx = i;
-            }
-        }
-        // If no valid frontier found (shouldn't happen if frontiers non-empty), return the first.
-        if (best_idx < 0)
-            return frontiers.front();
-        // Return the best frontier by index.
-        return frontiers[best_idx];
-    }
-
-    // Compute whether cell (r,c) has at least 'clearance_cells' of free/unknown from occupied
     bool hasClearance(const nav_msgs::OccupancyGrid &map, int r, int c, int clearance_cells) const
     {
         const int w = static_cast<int>(map.info.width);
@@ -492,24 +431,48 @@ private:
         {
             for (int dc = -clearance_cells; dc <= clearance_cells; ++dc)
             {
-                int nr = r + dr;
-                int nc = c + dc;
+                int nr = r + dr, nc = c + dc;
                 if (nr < 0 || nr >= h || nc < 0 || nc >= w)
                     continue;
-                // circle mask (approx): skip corners outside radius
                 if (dr * dr + dc * dc > clearance_cells * clearance_cells)
                     continue;
                 int8_t occ = map.data[idx(nr, nc, w)];
-                if (occ >= occ_threshold_) // definitely occupied
+                if (occ >= occ_threshold_)
                     return false;
             }
         }
         return true;
     }
 
-    // Choose a safe goal point inside the selected frontier cluster.
-    // Strategy: among frontier cells, prefer those with sufficient clearance; rank by
-    // (1) closeness to robot to reduce travel and (2) high clearance.
+    bool lineClear(const nav_msgs::OccupancyGrid &map, int r0, int c0, int r1, int c1, int clearance_cells) const
+    {
+        int dr = std::abs(r1 - r0);
+        int dc = std::abs(c1 - c0);
+        int sr = (r0 < r1) ? 1 : -1;
+        int sc = (c0 < c1) ? 1 : -1;
+        int err = (dr > dc ? dr : -dc) / 2;
+        int r = r0, c = c0;
+        while (true)
+        {
+            if (!hasClearance(map, r, c, clearance_cells))
+                return false;
+            if (r == r1 && c == c1)
+                break;
+            int e2 = err;
+            if (e2 > -dr)
+            {
+                err -= dc;
+                r += sr;
+            }
+            if (e2 < dc)
+            {
+                err += dr;
+                c += sc;
+            }
+        }
+        return true;
+    }
+
     geometry_msgs::Point chooseSafeGoal(const nav_msgs::OccupancyGrid &map, const Frontier &frontier, double rx, double ry)
     {
         geometry_msgs::Point best_p = frontier.centroid;
@@ -520,8 +483,8 @@ private:
         const int w = static_cast<int>(map.info.width);
         const int h = static_cast<int>(map.info.height);
         const int clearance_cells = std::max(1, static_cast<int>(std::floor((robot_radius_ + safety_margin_) / res)));
-
-        // Evaluate each frontier cell
+        const int unknown_rad_cells = std::max(1, static_cast<int>(std::floor(unknown_radius_m_ / res)));
+        const double min_goal_dist2 = min_goal_dist_m_ * min_goal_dist_m_;
         for (const auto &p : frontier.cells)
         {
             int c = static_cast<int>(std::floor((p.x - ox) / res));
@@ -529,28 +492,43 @@ private:
             if (r < 0 || r >= h || c < 0 || c >= w)
                 continue;
             int8_t occ = map.data[idx(r, c, w)];
-            if (occ < 0 || occ > free_threshold_) // require free-ish cell
+            if (occ < 0 || occ > free_threshold_)
                 continue;
             if (!hasClearance(map, r, c, clearance_cells))
                 continue;
-            // Score: distance to robot (prefer closer)
-            double dx = p.x - rx;
-            double dy = p.y - ry;
-            double score = dx * dx + dy * dy;
+            double dx = p.x - rx, dy = p.y - ry;
+            double d2 = dx * dx + dy * dy;
+            if (d2 < min_goal_dist2)
+                continue;
+            int unknown_cnt = 0;
+            for (int dr = -unknown_rad_cells; dr <= unknown_rad_cells; ++dr)
+                for (int dc = -unknown_rad_cells; dc <= unknown_rad_cells; ++dc)
+                {
+                    int nr = r + dr, nc = c + dc;
+                    if (nr < 0 || nr >= h || nc < 0 || nc >= w)
+                        continue;
+                    if (dr * dr + dc * dc > unknown_rad_cells * unknown_rad_cells)
+                        continue;
+                    if (map.data[idx(nr, nc, w)] < 0)
+                        unknown_cnt++;
+                }
+            int r0 = static_cast<int>(std::floor((ry - oy) / res));
+            int c0 = static_cast<int>(std::floor((rx - ox) / res));
+            if (r0 < 0 || r0 >= h || c0 < 0 || c0 >= w)
+                continue;
+            if (!lineClear(map, r0, c0, r, c, clearance_cells))
+                continue;
+            double score = weight_distance_ * std::sqrt(d2) - weight_unknown_ * static_cast<double>(unknown_cnt);
             if (score < best_score)
             {
                 best_score = score;
                 best_p = p;
             }
         }
-
         if (best_score != std::numeric_limits<double>::infinity())
             return best_p;
-
-        // Fallback: back off from centroid toward robot until clearance is found
         geometry_msgs::Point p = frontier.centroid;
-        double vx = rx - p.x;
-        double vy = ry - p.y;
+        double vx = p.x - rx, vy = p.y - ry;
         double vnorm = std::hypot(vx, vy);
         if (vnorm < 1e-3)
         {
@@ -560,12 +538,12 @@ private:
         }
         vx /= vnorm;
         vy /= vnorm;
-        int max_steps = std::max(3, clearance_cells * 2);
+        int max_steps = std::max(3, clearance_cells * 3);
         for (int k = 1; k <= max_steps; ++k)
         {
             geometry_msgs::Point q;
-            q.x = p.x + (-vx) * res * k; // step slightly away from frontier (toward robot)
-            q.y = p.y + (-vy) * res * k;
+            q.x = rx + vx * res * (min_goal_dist_m_ / res + k);
+            q.y = ry + vy * res * (min_goal_dist_m_ / res + k);
             q.z = 0.0;
             int c = static_cast<int>(std::floor((q.x - ox) / res));
             int r = static_cast<int>(std::floor((q.y - oy) / res));
@@ -575,71 +553,218 @@ private:
             if (occ >= 0 && occ <= free_threshold_ && hasClearance(map, r, c, clearance_cells))
                 return q;
         }
-
-        // Final fallback: return centroid (may be tight)
         return frontier.centroid;
     }
 
-    // Publish a PoseStamped at the given world point (map frame) as the next goal.
     void publishGoal(const geometry_msgs::Point &p)
     {
-        // Prepare a PoseStamped message (position + header).
         geometry_msgs::PoseStamped goal;
-        // Fill header frame so downstream knows the frame of reference (map).
         goal.header.frame_id = map_frame_;
-        // Stamp with current time for freshness.
         goal.header.stamp = ros::Time::now();
-        // Set position to the chosen centroid.
         goal.pose.position = p;
-        // Set a neutral orientation (yaw=0) using a unit quaternion (w=1 means no rotation).
         goal.pose.orientation.x = 0.0;
         goal.pose.orientation.y = 0.0;
         goal.pose.orientation.z = 0.0;
         goal.pose.orientation.w = 1.0;
-        // Publish on the configured topic for the planner to consume.
         goal_pub_.publish(goal);
-        // Log for visibility.
+        last_goal_ = p;
+        last_goal_time_ = goal.header.stamp;
+        recent_goals_.push_back({p, goal.header.stamp});
+        while (!recent_goals_.empty())
+        {
+            if ((goal.header.stamp - recent_goals_.front().second).toSec() > recent_goal_block_s_)
+                recent_goals_.pop_front();
+            else
+                break;
+        }
         ROS_INFO("FrontierExplorer: published next goal at (%.2f, %.2f)", p.x, p.y);
     }
 
+    void publishTempGoal(const geometry_msgs::Point &p)
+    {
+        geometry_msgs::PoseStamped goal;
+        goal.header.frame_id = map_frame_;
+        goal.header.stamp = ros::Time::now();
+        goal.pose.position = p;
+        goal.pose.orientation.x = 0.0;
+        goal.pose.orientation.y = 0.0;
+        goal.pose.orientation.z = 0.0;
+        goal.pose.orientation.w = 1.0;
+        goal_pub_.publish(goal);
+        last_goal_ = p;
+        last_goal_time_ = goal.header.stamp;
+        ROS_INFO("FrontierExplorer: published TEMP random goal at (%.2f, %.2f)", p.x, p.y);
+    }
+
+    bool shouldPublish(const geometry_msgs::Point &p)
+    {
+        if (last_goal_time_.isZero())
+            return true;
+        double dt = (ros::Time::now() - last_goal_time_).toSec();
+        if (dt < min_publish_period_s_)
+            return false;
+        double dx = p.x - last_goal_.x, dy = p.y - last_goal_.y;
+        double d2 = dx * dx + dy * dy;
+        return d2 >= (min_publish_separation_m_ * min_publish_separation_m_);
+    }
+
+    bool selectGoal(const nav_msgs::OccupancyGrid &map, const vector<Frontier> &frontiers, double rx, double ry, geometry_msgs::Point &out)
+    {
+        struct Cand
+        {
+            int idx;
+            double score;
+        };
+        vector<Cand> order;
+        order.reserve(frontiers.size());
+        for (int i = 0; i < static_cast<int>(frontiers.size()); ++i)
+        {
+            const auto &c = frontiers[i].centroid;
+            double dx = c.x - rx, dy = c.y - ry;
+            double dist = std::hypot(dx, dy);
+            double score = dist - 0.5 * std::sqrt(std::max(0.0, frontiers[i].size));
+            order.push_back({i, score});
+        }
+        std::sort(order.begin(), order.end(), [](const Cand &a, const Cand &b)
+                  { return a.score < b.score; });
+        for (const auto &c : order)
+        {
+            geometry_msgs::Point g = chooseSafeGoal(map, frontiers[c.idx], rx, ry);
+            out = g;
+            return true;
+        }
+        return false;
+    }
+
+    bool computeRandomGoal(const nav_msgs::OccupancyGrid &map, double rx, double ry, geometry_msgs::Point &out)
+    {
+        const double res = map.info.resolution;
+        const double ox = map.info.origin.position.x;
+        const double oy = map.info.origin.position.y;
+        const int w = static_cast<int>(map.info.width);
+        const int h = static_cast<int>(map.info.height);
+        const int clearance_cells = std::max(1, static_cast<int>(std::floor((robot_radius_ + safety_margin_) / res)));
+        std::uniform_real_distribution<double> ang_dist(0.0, 2.0 * M_PI);
+        std::uniform_real_distribution<double> jitter_dist(0.0, M_PI / 2.0);
+        std::uniform_int_distribution<int> sign_dist(0, 1);
+        int r0 = static_cast<int>(std::floor((ry - oy) / res));
+        int c0 = static_cast<int>(std::floor((rx - ox) / res));
+        if (r0 < 0 || r0 >= h || c0 < 0 || c0 >= w)
+            return false;
+        for (int t = 0; t < random_trials_; ++t)
+        {
+            double theta = ang_dist(rng_);
+            for (int j = 0; j < 2; ++j)
+            {
+                double qx = rx + random_step_m_ * std::cos(theta);
+                double qy = ry + random_step_m_ * std::sin(theta);
+                int r1 = static_cast<int>(std::floor((qy - oy) / res));
+                int c1 = static_cast<int>(std::floor((qx - ox) / res));
+                if (r1 >= 0 && r1 < h && c1 >= 0 && c1 < w)
+                {
+                    int8_t occ = map.data[idx(r1, c1, w)];
+                    if (occ >= 0 && occ <= free_threshold_ && hasClearance(map, r1, c1, clearance_cells) && lineClear(map, r0, c0, r1, c1, clearance_cells))
+                    {
+                        out.x = qx;
+                        out.y = qy;
+                        out.z = 0.0;
+                        return true;
+                    }
+                }
+                double delta = jitter_dist(rng_);
+                theta += (sign_dist(rng_) ? delta : -delta);
+            }
+        }
+        return false;
+    }
+
+    double scorePoint(const nav_msgs::OccupancyGrid &map, double rx, double ry, const geometry_msgs::Point &p) const
+    {
+        const double res = map.info.resolution;
+        const double ox = map.info.origin.position.x;
+        const double oy = map.info.origin.position.y;
+        const int w = static_cast<int>(map.info.width);
+        const int h = static_cast<int>(map.info.height);
+        int c = static_cast<int>(std::floor((p.x - ox) / res));
+        int r = static_cast<int>(std::floor((p.y - oy) / res));
+        if (r < 0 || r >= h || c < 0 || c >= w)
+            return std::numeric_limits<double>::infinity();
+        double dx = p.x - rx, dy = p.y - ry;
+        double dist = std::hypot(dx, dy);
+        const int unknown_rad_cells = std::max(1, static_cast<int>(std::floor(unknown_radius_m_ / res)));
+        int unknown_cnt = 0;
+        for (int dr = -unknown_rad_cells; dr <= unknown_rad_cells; ++dr)
+            for (int dc = -unknown_rad_cells; dc <= unknown_rad_cells; ++dc)
+            {
+                int nr = r + dr, nc = c + dc;
+                if (nr < 0 || nr >= h || nc < 0 || nc >= w)
+                    continue;
+                if (dr * dr + dc * dc > unknown_rad_cells * unknown_rad_cells)
+                    continue;
+                if (map.data[idx(nr, nc, w)] < 0)
+                    unknown_cnt++;
+            }
+        return weight_distance_ * dist - weight_unknown_ * static_cast<double>(unknown_cnt);
+    }
+
+    bool isRecentlyUsed(const geometry_msgs::Point &p) const
+    {
+        double r2 = recent_goal_radius_m_ * recent_goal_radius_m_;
+        for (const auto &pr : recent_goals_)
+        {
+            double dx = p.x - pr.first.x, dy = p.y - pr.first.y;
+            if (dx * dx + dy * dy <= r2)
+                return true;
+        }
+        return false;
+    }
+
+    void setCurrentGoal(const geometry_msgs::Point &p, double rx, double ry, const nav_msgs::OccupancyGrid &)
+    {
+        current_goal_ = p;
+        current_goal_time_ = ros::Time::now();
+        current_goal_active_ = true;
+        last_progress_check_ = current_goal_time_;
+        last_progress_dist_ = std::hypot(p.x - rx, p.y - ry);
+    }
+
 private:
-    // Node handles (global and private) for parameters and topic setup.
     ros::NodeHandle nh_, pnh_;
     tf::TransformListener tf_listener_;
-    ros::Subscriber map_sub_;
-    ros::Subscriber odom_sub_;
-    // Publisher for the next frontier goal.
+    ros::Subscriber map_sub_, odom_sub_;
     ros::Publisher goal_pub_;
-    string robot_pose_topic_;
-    // Timer for periodic processing of frontier detection and goal selection.
     ros::Timer timer_;
 
-    // Latest map and a flag indicating whether we have received one.
     nav_msgs::OccupancyGrid latest_map_;
     nav_msgs::Odometry last_odom_;
     bool have_map_;
 
-    // Frames and topics configurable via parameters.
-    string map_frame_;
-    string robot_frame_;
-    string goal_topic_;
-    string map_topic_;
-
-    // Frontier detection parameters (thresholds and cluster size filter).
-    int free_threshold_;
-    int occ_threshold_;
-    int min_frontier_cells_;
-
-    // Fallback exploration state (when no map is available)
+    string map_frame_, robot_frame_, goal_topic_, map_topic_, robot_pose_topic_;
+    int free_threshold_, occ_threshold_, min_frontier_cells_;
     bool fallback_enabled_;
-    double fb_angle_;
-    double fb_radius_;
-    double fb_radius_max_;
-    double fb_angle_step_;
-    double fb_radius_step_;
-    // Clearance parameters
-    double robot_radius_;
-    double safety_margin_;
+    double fb_angle_, fb_radius_, fb_radius_max_, fb_angle_step_, fb_radius_step_;
+    double robot_radius_, safety_margin_;
+    double min_goal_dist_m_, min_publish_separation_m_, min_publish_period_s_;
+    double unknown_radius_m_, weight_unknown_, weight_distance_;
+
+    deque<std::pair<geometry_msgs::Point, ros::Time> > recent_goals_;
+    bool current_goal_active_;
+    geometry_msgs::Point current_goal_;
+    ros::Time current_goal_time_, last_progress_check_;
+    double last_progress_dist_;
+    double switch_improvement_, goal_timeout_s_, progress_window_s_, min_progress_m_;
+    double recent_goal_block_s_, recent_goal_radius_m_;
+
+    geometry_msgs::Point last_goal_;
+    ros::Time last_goal_time_;
+
+    std::mt19937 rng_;
+    double random_step_m_;
+    int random_trials_;
+    double temp_hold_s_;
+    bool temp_goal_active_;
+    geometry_msgs::Point temp_goal_;
+    ros::Time temp_goal_until_;
 };
 
 int main(int argc, char **argv)
@@ -647,9 +772,7 @@ int main(int argc, char **argv)
     ros::init(argc, argv, "frontier_explorer");
     ros::NodeHandle nh;
     ros::NodeHandle pnh("~");
-
     FrontierExplorer explorer(nh, pnh);
-
     ros::spin();
     return 0;
 }
