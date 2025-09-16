@@ -5,5 +5,11 @@
     <param name="object_list_file_dir" type="string" value="$(find dummy_vlm)/data/object_list.txt" />
     <param name="waypointReachDis" type="double" value="1.0" />
   </node>
+  <node pkg="dummy_vlm" type="frontier_explorer" name="frontier_explorer" output="screen">
+    <param name="map_topic" value="/map"/>
+    <param name="goal_topic" value="/next_goal"/>
+    <param name="map_frame" value="map"/>
+    <param name="robot_frame" value="base_link"/>
+  </node>
 
 </launch>
