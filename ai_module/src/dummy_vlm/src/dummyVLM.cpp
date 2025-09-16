@@ -339,14 +339,8 @@ std::string askMistral(const std::string &question)
   std::string url = "https://api.mistral.ai/v1/chat/completions";
 
   // Add your instructions here
-  std::string instructions = R"(You are going to be asked one of three types of questions and are provided a datasheet of information.  
-The datasheet provides the time, object name, x/y/z coordinates in space, and reference image in that order. Use it to answer the questions as accurately as possible.  
-
-The first question type is "Numerical" and it takes the form of a question like "How many blue chairs are between the table and the wall?" or "How many black trash cans are near the window?". You must go through the datasheet to find an integer value as the answer. Respond with only a singular integer, without extraneous information.  
-
-The second question type is "Object Reference" and it takes the form of a question like "Find the potted plant on the kitchen island that is closest to the fridge." or "Find the orange chair between the table and sink that is closest to the window.". You must go through the spreadsheet to find the unique object that most closely matches this description. Respond with only the image file corresponding to the correct object. Respond with only a single image file name, without extraneous information.  
-
-The third question type is "Instruction-Following" and it takes the form of a question like "Take the path near the window to the fridge." or "Avoid the path between the two tables and go near the blue trash can near the window.". You start at (0,0). You can only move up, down, left, or right in this grid in single integer-valued squares. Write out the coordinates of the steps for you to accomplish the task provided. Provide only a sequence of coordinates in the form (x,y) - each on a new line.)";
+  std::string instructions = R"(You are going to provided a datasheet of information providing the time, object name, x/y/z coordinates in space, and reference image names in that order.
+  Use it to answer the following types of questions when prompted. Answer "How many ..." questions with only a singular integer. Answer "Find the ..." questions with only the image file corresponding to the correct unique object. Answer pathing questions by writing out a sequence of intever-valued coordinates moving only up/down/left/right to accomplish the asked task.";
 
   std::string payload = R"({
         "model":"mistral-large-latest",
