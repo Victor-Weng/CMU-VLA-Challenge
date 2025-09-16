@@ -581,7 +581,7 @@ bool handleNavCommand(const std::string &q, ros::Publisher &waypointPub, geometr
   }
 
   // Run Python script to compute 3D object coordinates
-  std::string pythonOutput = runPythonScript("../src/getting-3d-coords.py");
+  std::string pythonOutput = runPythonScript("getting-3d-coords.py");
   if (!pythonOutput.empty())
   {
     ROS_INFO("[Python] Output:\n%s", pythonOutput.c_str());
