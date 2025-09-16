@@ -4,11 +4,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ros/ros.h>
-#include <cstdlib>   // for system()
-#include <cstdio>    // for popen()
-#include <memory>    // for unique_ptr
-#include <array>     // for buffer
-
+#include <cstdlib> // for system()
+#include <cstdio>  // for popen()
+#include <memory>  // for unique_ptr
+#include <array>   // for buffer
 
 #include <nav_msgs/Odometry.h>
 #include <nav_msgs/OccupancyGrid.h>
@@ -77,6 +76,30 @@ static size_t WriteCallback(void *contents, size_t size, size_t nmemb, void *use
   return totalSize;
 }
 
+// Helper: run a Python script and capture stdout as a string
+static std::string runPythonScript(const std::string &scriptPath)
+{
+  std::array<char, 128> buffer{};
+  std::string result;
+
+  // Open a pipe to run Python
+  std::string cmd = std::string("python3 ") + scriptPath;
+  std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(cmd.c_str(), "r"), pclose);
+
+  if (!pipe)
+  {
+    std::cerr << "[ERROR] Failed to run Python script: " << scriptPath << std::endl;
+    return "";
+  }
+
+  while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr)
+  {
+    result += buffer.data();
+  }
+
+  return result;
+}
+
 // --- Stagnation detection & recovery state ---
 static geometry_msgs::Pose2D g_lastWp;         // last published waypoint
 static ros::Time g_lastWpStamp;                // time we last published any waypoint
@@ -124,6 +147,7 @@ static ros::Time g_goHomeStepDeadline;     // current step deadline
 // Track whether we've run frontier at least once in this session
 static bool g_frontierWasRun = false;
 static double g_frontierWarmupSec = 20.0; // default warmup duration before answering
+static bool g_shutdownAfterAnswer = true; // stop node after answering by default
 
 // Helper: record (and de-dup) waypoint events
 static inline void recordWaypoint(const geometry_msgs::Pose2D &wp)
@@ -384,32 +408,6 @@ bool handleNavCommand(const std::string &q, ros::Publisher &waypointPub, geometr
     return true;
   }
 
-
-
-
-std::string runPythonScript(const std::string &scriptPath)
-{
-    std::array<char, 128> buffer;
-    std::string result;
-
-    // Open a pipe to run Python
-    std::string cmd = "python3 " + scriptPath;
-    std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(cmd.c_str(), "r"), pclose);
-
-    if (!pipe)
-    {
-        std::cerr << "[ERROR] Failed to run Python script: " << scriptPath << std::endl;
-        return "";
-    }
-
-    while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr)
-    {
-        result += buffer.data();
-    }
-
-    return result;
-}
-
   // COMMAND: frontier control commands
   // "frontier start" -> enable bridging from /next_goal
   // "frontier stop"  -> disable bridging
@@ -546,7 +544,6 @@ std::string runPythonScript(const std::string &scriptPath)
     return true;
   }
 
-  
   // Run Python script to compute 3D object coordinates
   std::string pythonOutput = runPythonScript("../data/getting-3d-coords.py");
   if (!pythonOutput.empty())
@@ -980,6 +977,7 @@ int main(int argc, char **argv)
   nhPrivate.param("home_go_timeout_sec", g_homeGoTimeoutSec, g_homeGoTimeoutSec);
   nhPrivate.param("home_push_timeout_sec", g_homePushTimeoutSec, g_homePushTimeoutSec);
   nhPrivate.param("frontier_warmup_sec", g_frontierWarmupSec, g_frontierWarmupSec);
+  nhPrivate.param("shutdown_after_answer", g_shutdownAfterAnswer, g_shutdownAfterAnswer);
 
   ros::Subscriber subPose = nh.subscribe<nav_msgs::Odometry>("/state_estimation", 5, poseHandler);
 
@@ -1000,6 +998,8 @@ int main(int argc, char **argv)
 
   // Publish raw LLM (Mistral) responses for visibility
   ros::Publisher mistralResponsePub = nh.advertise<std_msgs::String>("/mistral_response", 5);
+  // Publish a consolidated final answer string for downstream consumers
+  ros::Publisher finalAnswerPub = nh.advertise<std_msgs::String>("/final_answer", 5);
 
   // local alias for publishing waypoints inside this function
   ros::Publisher &waypointPub = g_waypointPub;
@@ -1133,6 +1133,21 @@ int main(int argc, char **argv)
   }
 })";
     ROS_INFO("Question handling schema:%s\n%s", "", schema);
+
+    // Publish final consolidated answer and optionally shutdown
+    {
+      std_msgs::String finalMsg;
+      finalMsg.data = mistralOut;
+      finalAnswerPub.publish(finalMsg);
+      ROS_INFO("Final answer published to /final_answer. %s", g_shutdownAfterAnswer ? "Shutting down." : "");
+    }
+    // Ensure frontier bridging is disabled after handling
+    g_frontierEnabled = false;
+    if (g_shutdownAfterAnswer)
+    {
+      ros::shutdown();
+      break;
+    }
 
     question.clear();
     ROS_INFO("Awaiting question...");
