@@ -39,3 +39,9 @@ target_link_libraries(pc_to_grid ${catkin_LIBRARIES})
 add_dependencies(pc_to_grid ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
 target_link_libraries(image_lidar_capture ${catkin_LIBRARIES})
 add_dependencies(image_lidar_capture ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
+
+# Install Python scripts (ROS nodes)
+catkin_install_python(PROGRAMS
+  scripts/camera_save_and_detect.py
+  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)

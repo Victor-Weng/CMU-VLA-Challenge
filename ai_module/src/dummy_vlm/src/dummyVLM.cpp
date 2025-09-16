@@ -93,6 +93,15 @@ static double g_longStagnationSec = 30.0;    // how long of no progress triggers
 static double g_homeX = 0.0, g_homeY = 0.0;  // home waypoint in map frame
 static double g_homePauseSec = 1.0;          // pause duration at home before resuming
 static ros::Time g_lastProgress;             // last time we detected movement >= g_minMove
+// Go-home sequence state
+static int g_goHomePhase = 0;              // 0=idle, 1=going_home, 2=push_out
+static geometry_msgs::Pose2D g_homeWp;     // home waypoint (x=g_homeX, y=g_homeY, theta=opposite yaw)
+static geometry_msgs::Pose2D g_homePushWp; // push-out waypoint from home along opposite yaw
+static double g_homeReachThresh = 0.30;    // meters to consider home reached
+static double g_homePushDist = 3.0;        // meters to push from home along opposite heading
+static double g_homeGoTimeoutSec = 20.0;   // seconds timeout to reach home
+static double g_homePushTimeoutSec = 10.0; // seconds timeout to complete push-out
+static ros::Time g_goHomeStepDeadline;     // current step deadline
 
 // Helper: record (and de-dup) waypoint events
 static inline void recordWaypoint(const geometry_msgs::Pose2D &wp)
@@ -732,16 +741,35 @@ void diagnosticsTimerCb(const ros::TimerEvent &)
       bool longStagnation = g_goHomeOnLongStagnation && !g_lastProgress.isZero() && ((now - g_lastProgress).toSec() > g_longStagnationSec);
       if (longStagnation)
       {
-        geometry_msgs::Pose2D home;
-        home.x = g_homeX;
-        home.y = g_homeY;
-        home.theta = 0.0;
-        ROS_WARN("Recovery: long stagnation detected (%.0fs) -> going to home (%.2f, %.2f) and pausing %.1fs",
-                 (now - g_lastProgress).toSec(), g_homeX, g_homeY, g_homePauseSec);
-        g_waypointPub.publish(home);
-        recordWaypoint(home);
+        // Compute opposite heading from the last observed yaw
+        tf::Quaternion qh;
+        tf::quaternionMsgToTF(g_lastOdom.pose.pose.orientation, qh);
+        double r_h, p_h, y_h;
+        tf::Matrix3x3(qh).getRPY(r_h, p_h, y_h);
+        double oppositeYaw = y_h + M_PI;
+        while (oppositeYaw > M_PI)
+          oppositeYaw -= 2.0 * M_PI;
+        while (oppositeYaw < -M_PI)
+          oppositeYaw += 2.0 * M_PI;
+
+        // Initialize go-home sequence
+        g_goHomePhase = 1; // going_home
+        g_homeWp.x = g_homeX;
+        g_homeWp.y = g_homeY;
+        g_homeWp.theta = static_cast<float>(oppositeYaw);
+        // Push-out waypoint from home along opposite heading
+        g_homePushWp.x = g_homeWp.x + g_homePushDist * std::cos(oppositeYaw);
+        g_homePushWp.y = g_homeWp.y + g_homePushDist * std::sin(oppositeYaw);
+        g_homePushWp.theta = static_cast<float>(oppositeYaw);
+
+        ROS_WARN("Recovery: long stagnation detected (%.0fs) -> going to home (%.2f, %.2f) facing opposite (yaw=%.2f)",
+                 (now - g_lastProgress).toSec(), g_homeWp.x, g_homeWp.y, g_homeWp.theta);
+        g_waypointPub.publish(g_homeWp);
+        recordWaypoint(g_homeWp);
         g_lastRecovery = now;
-        g_recoveryHoldUntil = now + ros::Duration(g_homePauseSec);
+        g_goHomeStepDeadline = now + ros::Duration(g_homeGoTimeoutSec);
+        // Hold frontier bridging off during the go-home sequence
+        g_recoveryHoldUntil = now + ros::Duration(std::max(g_homePauseSec, 1.0));
         // Skip backup-turn path this time
         return;
       }
@@ -786,7 +814,38 @@ void diagnosticsTimerCb(const ros::TimerEvent &)
     }
 
     // Drive recovery sequence steps
-    if (g_recoveryPhase == 1)
+    if (g_goHomePhase == 1)
+    {
+      // Driving to home: check distance or timeout
+      double dx = vehicleX - g_homeWp.x;
+      double dy = vehicleY - g_homeWp.y;
+      double dist = std::sqrt(dx * dx + dy * dy);
+      if (dist < g_homeReachThresh || now >= g_goHomeStepDeadline)
+      {
+        // Arrived (or give up), pause briefly, then push out
+        ROS_INFO("Go-Home: reached home within %.2fm (or timeout). Pausing %.1fs, then pushing out %.1fm",
+                 g_homeReachThresh, g_homePauseSec, g_homePushDist);
+        g_goHomePhase = 2;
+        g_goHomeStepDeadline = now + ros::Duration(g_homePushTimeoutSec);
+        g_recoveryHoldUntil = now + ros::Duration(g_homePauseSec);
+        // Publish the push-out waypoint after the pause window; for simplicity publish now
+        g_waypointPub.publish(g_homePushWp);
+        recordWaypoint(g_homePushWp);
+      }
+    }
+    else if (g_goHomePhase == 2)
+    {
+      // Pushing out: finish on timeout or when near target
+      double dx = vehicleX - g_homePushWp.x;
+      double dy = vehicleY - g_homePushWp.y;
+      double dist = std::sqrt(dx * dx + dy * dy);
+      if (dist < g_recoveryReachThresh || now >= g_goHomeStepDeadline)
+      {
+        ROS_INFO("Go-Home: push-out complete. Resuming normal operation.");
+        g_goHomePhase = 0; // done
+      }
+    }
+    else if (g_recoveryPhase == 1)
     {
       // Check if backup reached or deadline passed
       double dx = vehicleX - g_recoveryBackupWp.x;
@@ -844,6 +903,10 @@ int main(int argc, char **argv)
   nhPrivate.param("home_x", g_homeX, g_homeX);
   nhPrivate.param("home_y", g_homeY, g_homeY);
   nhPrivate.param("home_pause_sec", g_homePauseSec, g_homePauseSec);
+  nhPrivate.param("home_reach_thresh", g_homeReachThresh, g_homeReachThresh);
+  nhPrivate.param("home_push_dist", g_homePushDist, g_homePushDist);
+  nhPrivate.param("home_go_timeout_sec", g_homeGoTimeoutSec, g_homeGoTimeoutSec);
+  nhPrivate.param("home_push_timeout_sec", g_homePushTimeoutSec, g_homePushTimeoutSec);
 
   ros::Subscriber subPose = nh.subscribe<nav_msgs::Odometry>("/state_estimation", 5, poseHandler);
 
