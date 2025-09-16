@@ -344,8 +344,30 @@ std::string askMistral(const std::string &question)
 
   // Add your instructions here
   std::string instructions = R"(You are going to provided a datasheet of information providing the time, object name, x/y/z coordinates in space, and reference image names in that order.
-  Use it to answer the following types of questions when prompted. Answer "How many ..." questions with only a singular integer. Answer "Find the ..." questions with only the image file corresponding to the correct unique object. Answer pathing questions by writing out a sequence of intever-valued coordinates moving only up/down/left/right to accomplish the asked task.";
+  Use it to answer the following types of questions when prompted. Answer "How many ..." questions with only a singular integer. Answer "Find the ..." questions with only the image file corresponding to the correct unique object. Answer pathing questions by writing out a sequence of intever-valued coordinates moving only up/down/left/right to accomplish the asked task.)";
 
+
+// Open the object list file
+std::ifstream file("../data/object_list_updated.txt");
+if (!file)
+{
+    std::cerr << "Failed to open ../data/object_list_updated.txt" << std::endl;
+}
+else
+{
+    std::stringstream buffer;
+    buffer << file.rdbuf();          // Read entire file
+    std::string object_list = buffer.str();
+
+    // Remove all newlines and carriage returns
+    object_list.erase(std::remove(object_list.begin(), object_list.end(), '\n'), object_list.end());
+    object_list.erase(std::remove(object_list.begin(), object_list.end(), '\r'), object_list.end());
+
+    // Append directly to instructions
+    instructions += object_list;
+}
+
+  
   std::string payload = R"({
         "model":"mistral-large-latest",
         "messages":[
