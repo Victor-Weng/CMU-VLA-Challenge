@@ -221,17 +221,26 @@ class PairedDetectAndDepth:
             return TriggerResponse(success=False, message=emsg)
 
     def _clear_files(self):
-        # Ensure directories exist then truncate object list
+        # Delete and recreate the object list (and image if requested)
         try:
-            os.makedirs(os.path.dirname(self.object_list_path), exist_ok=True)
+            dirp = os.path.dirname(self.object_list_path)
+            if dirp:
+                os.makedirs(dirp, exist_ok=True)
+            if os.path.isfile(self.object_list_path):
+                os.remove(self.object_list_path)
         except Exception:
             pass
-        with open(self.object_list_path, 'w'):
+        # Recreate empty file explicitly
+        try:
+            with open(self.object_list_path, 'w'):
+                pass
+        except Exception:
             pass
         if self.also_clear_image:
             try:
-                # Truncate if exists, else ensure path
                 os.makedirs(self.image_dir, exist_ok=True)
+                if os.path.isfile(self.save_path):
+                    os.remove(self.save_path)
                 with open(self.save_path, 'w'):
                     pass
             except Exception:

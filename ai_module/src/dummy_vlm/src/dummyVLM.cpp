@@ -59,6 +59,19 @@ static ros::Time g_lastMapTime;       // latest /map stamp observed (if we subsc
 static std::string g_mapFrame = "map";
 static std::string g_robotFrame = "base_link";
 
+// libcurl write callback to collect HTTP response into a std::string
+static size_t WriteCallback(void *contents, size_t size, size_t nmemb, void *userp)
+{
+  size_t totalSize = size * nmemb;
+  if (!userp || !contents)
+  {
+    return totalSize;
+  }
+  std::string *s = static_cast<std::string *>(userp);
+  s->append(static_cast<const char *>(contents), totalSize);
+  return totalSize;
+}
+
 // --- Stagnation detection & recovery state ---
 static geometry_msgs::Pose2D g_lastWp;         // last published waypoint
 static ros::Time g_lastWpStamp;                // time we last published any waypoint
@@ -267,19 +280,19 @@ void readObjectListFile()
 //  Callback for curl to write response data
 std::string askMistral(const std::string &question)
 {
-    std::string response;
+  std::string response;
 
-    CURL *curl = curl_easy_init();
-    if (!curl)
-    {
-        std::cerr << "Failed to initialize curl." << std::endl;
-        return "";
-    }
+  CURL *curl = curl_easy_init();
+  if (!curl)
+  {
+    std::cerr << "Failed to initialize curl." << std::endl;
+    return "";
+  }
 
-    std::string url = "https://api.mistral.ai/v1/chat/completions";
+  std::string url = "https://api.mistral.ai/v1/chat/completions";
 
-    // Add your instructions here
-    std::string instructions = R"(You are going to be asked one of three types of questions and are provided a datasheet of information.  
+  // Add your instructions here
+  std::string instructions = R"(You are going to be asked one of three types of questions and are provided a datasheet of information.  
 The datasheet provides the time, object name, x/y/z coordinates in space, and reference image in that order. Use it to answer the questions as accurately as possible.  
 
 The first question type is "Numerical" and it takes the form of a question like "How many blue chairs are between the table and the wall?" or "How many black trash cans are near the window?". You must go through the datasheet to find an integer value as the answer. Respond with only a singular integer, without extraneous information.  
@@ -288,47 +301,48 @@ The second question type is "Object Reference" and it takes the form of a questi
 
 The third question type is "Instruction-Following" and it takes the form of a question like "Take the path near the window to the fridge." or "Avoid the path between the two tables and go near the blue trash can near the window.". You start at (0,0). You can only move up, down, left, or right in this grid in single integer-valued squares. Write out the coordinates of the steps for you to accomplish the task provided. Provide only a sequence of coordinates in the form (x,y) - each on a new line.)";
 
-    std::string payload = R"({
+  std::string payload = R"({
         "model":"mistral-large-latest",
         "messages":[
-            {"role":"system","content":")" + instructions + R"("},
-            {"role":"user","content":")" + question + R"("}
+            {"role":"system","content":")" +
+                        instructions + R"("},
+            {"role":"user","content":")" +
+                        question + R"("}
         ]
     })";
 
-    struct curl_slist *headers = nullptr;
-    headers = curl_slist_append(headers, "Content-Type: application/json");
-    headers = curl_slist_append(headers, "Authorization: Bearer OFgLAX07gC1v65hDAfeU4AoZNI9ehcMa");
+  struct curl_slist *headers = nullptr;
+  headers = curl_slist_append(headers, "Content-Type: application/json");
+  headers = curl_slist_append(headers, "Authorization: Bearer OFgLAX07gC1v65hDAfeU4AoZNI9ehcMa");
 
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payload.c_str());
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+  curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+  curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payload.c_str());
+  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+  curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
 
-    CURLcode res = curl_easy_perform(curl);
-    if (res != CURLE_OK)
-    {
-        std::cerr << "Curl failed: " << curl_easy_strerror(res) << std::endl;
-        response = "";
-    }
+  CURLcode res = curl_easy_perform(curl);
+  if (res != CURLE_OK)
+  {
+    std::cerr << "Curl failed: " << curl_easy_strerror(res) << std::endl;
+    response = "";
+  }
 
-    curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
+  curl_slist_free_all(headers);
+  curl_easy_cleanup(curl);
 
-    // Parse JSON to get assistant content
-    try
-    {
-        auto j = json::parse(response);
-        return j["choices"][0]["message"]["content"];
-    }
-    catch (...)
-    {
-        std::cerr << "Failed to parse response." << std::endl;
-        return "";
-    }
+  // Parse JSON to get assistant content
+  try
+  {
+    auto j = json::parse(response);
+    return j["choices"][0]["message"]["content"];
+  }
+  catch (...)
+  {
+    std::cerr << "Failed to parse response." << std::endl;
+    return "";
+  }
 }
-
 
 // handle navigator commands (to be replaced by LLM later)
 // Parse and execute simple nav commands
