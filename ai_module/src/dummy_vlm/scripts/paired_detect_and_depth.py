@@ -57,7 +57,7 @@ class PairedDetectAndDepth:
                     raise
 
         self.detector_script = os.path.join(objdet_dir, 'object_detection.py')
-    self.bridge = CvBridge() if CvBridge is not None else None
+        self.bridge = CvBridge() if CvBridge is not None else None
         self.tf_listener = tf.TransformListener()
 
         # Subscribers with synchronization
@@ -82,7 +82,7 @@ class PairedDetectAndDepth:
                 rospy.logwarn('cv_bridge conversion failed: %s', str(e))
                 cv_img = None
         if cv_img is None:
-            cv_img = rosimg_to_cv2_bgr(img_msg)
+            cv_img = _rosimg_to_cv2(img_msg)
             if cv_img is None:
                 rospy.logwarn('Failed to convert image without cv_bridge')
                 return
@@ -266,7 +266,7 @@ def _convert_encoding_to_bgr(img, encoding):
         return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
     return img
 
-def rosimg_to_cv2_bgr(msg):
+def _rosimg_to_cv2(msg):
     enc = (msg.encoding or '').lower()
     if enc in ('mono8', '8uc1'):
         img = _mono_bytes_to_array(msg)

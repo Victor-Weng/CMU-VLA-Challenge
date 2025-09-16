@@ -17,6 +17,35 @@ import numpy as np
 
 
 class CameraSaveAndDetect:
+    @staticmethod
+    def _rosimg_to_cv2(msg):
+        enc = (getattr(msg, 'encoding', '') or '').lower()
+        width = msg.width
+        height = msg.height
+        step = msg.step
+        buf = np.frombuffer(msg.data, dtype=np.uint8)
+        # mono8 path
+        if enc in ('mono8', '8uc1'):
+            if step == width:
+                img = buf.reshape((height, width))
+            else:
+                img = buf.reshape((height, step))[:, :width]
+            return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        # assume 3 channels
+        channels = 3
+        if step == width * channels:
+            img = buf.reshape((height, width, channels))
+        else:
+            img = buf.reshape((height, step))[:, :width * channels].reshape((height, width, channels))
+        if enc in ('rgb8', 'rgb16'):
+            return cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        if enc in ('rgba8', 'bgra8'):
+            if enc.startswith('rgba'):
+                return cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
+            else:
+                return cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+        # default treat as BGR
+        return img
     def __init__(self):
         self.image_topic = rospy.get_param('~image_topic', '/camera/image')
         self.interval_sec = float(rospy.get_param('~interval_sec', 10.0))
@@ -51,7 +80,7 @@ class CameraSaveAndDetect:
             if e.errno != errno.EEXIST:
                 raise
 
-    self.bridge = CvBridge() if CvBridge is not None else None
+        self.bridge = CvBridge() if CvBridge is not None else None
         self.last_save_time = rospy.Time(0)
         self.last_rx_time = rospy.Time(0)
 
@@ -210,5 +239,4 @@ def rosimg_to_cv2_bgr(msg):
     img = _bytes_to_array(msg, 3)
     return _convert_encoding_to_bgr(img, enc)
 
-# Bind as method of class for convenience
-CameraSaveAndDetect._rosimg_to_cv2 = staticmethod(rosimg_to_cv2_bgr)
+# Keep module-level helper available (optional), but class now has its own implementation
