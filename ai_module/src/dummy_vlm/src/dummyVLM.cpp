@@ -8,6 +8,12 @@
 #include <cstdio>  // for popen()
 #include <memory>  // for unique_ptr
 #include <array>   // for buffer
+#include <fstream>   // for std::ifstream
+#include <sstream>   // for std::stringstream
+#include <string>    // for std::string
+#include <algorithm> // for std::remove
+#include <iostream>  // for std::cerr, std::cout
+
 
 #include <nav_msgs/Odometry.h>
 #include <nav_msgs/OccupancyGrid.h>
