@@ -521,6 +521,10 @@ class PairedDetectAndDepth:
                               self.dedup_dist_tol_m)
             else:
                 rospy.logdebug('paired_detect_and_depth: dedup kept all %d detections', len(results))
+
+        # Append to object_list.txt (now includes robot x, y and image file name)
+        try:
+            with open(self.object_list_path, 'a') as f:
                 img_name = os.path.basename(out_path)
                 for (label, u, v, dist) in results:
                     px = self.pose_x if not math.isnan(self.pose_x) else -1
@@ -538,6 +542,8 @@ class PairedDetectAndDepth:
                 f.flush()
                 os.fsync(f.fileno())
             rospy.loginfo('paired_detect_and_depth: wrote %d detections to %s (pose x=%.3f y=%.3f, img=%s)', len(results), self.object_list_path, self.pose_x, self.pose_y, os.path.basename(out_path))
+        except Exception as e:
+            rospy.logwarn('Failed writing object list: %s', str(e))
         # If we have a pending "specific" request, render and save filtered boxes now
         if self._pending_specific and self.last_image_path:
             try:
