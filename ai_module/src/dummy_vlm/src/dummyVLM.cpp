@@ -4,16 +4,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ros/ros.h>
-#include <cstdlib> // for system()
-#include <cstdio>  // for popen()
-#include <memory>  // for unique_ptr
-#include <array>   // for buffer
+#include <cstdlib>   // for system()
+#include <cstdio>    // for popen()
+#include <memory>    // for unique_ptr
+#include <array>     // for buffer
 #include <fstream>   // for std::ifstream
 #include <sstream>   // for std::stringstream
 #include <string>    // for std::string
 #include <algorithm> // for std::remove
 #include <iostream>  // for std::cerr, std::cout
-
 
 #include <nav_msgs/Odometry.h>
 #include <nav_msgs/OccupancyGrid.h>
@@ -352,17 +351,16 @@ std::string askMistral(const std::string &question)
   std::string instructions = R"(You are going to provided a datasheet of information providing the time, object name, x/y/z coordinates in space, and reference image names in that order.
   Use it to answer the following types of questions when prompted. Answer "How many ..." questions with only a singular integer. Answer "Find the ..." questions with only the image file corresponding to the correct unique object. Answer pathing questions by writing out a sequence of intever-valued coordinates moving only up/down/left/right to accomplish the asked task.)";
 
-
-// Open the object list file
-std::ifstream file("../data/object_list_updated.txt");
-if (!file)
-{
+  // Open the object list file
+  std::ifstream file("../data/object_list_updated.txt");
+  if (!file)
+  {
     std::cerr << "Failed to open ../data/object_list_updated.txt" << std::endl;
-}
-else
-{
+  }
+  else
+  {
     std::stringstream buffer;
-    buffer << file.rdbuf();          // Read entire file
+    buffer << file.rdbuf(); // Read entire file
     std::string object_list = buffer.str();
 
     // Remove all newlines and carriage returns
@@ -371,9 +369,8 @@ else
 
     // Append directly to instructions
     instructions += object_list;
-}
+  }
 
-  
   std::string payload = R"({
         "model":"mistral-large-latest",
         "messages":[
@@ -584,7 +581,7 @@ bool handleNavCommand(const std::string &q, ros::Publisher &waypointPub, geometr
   }
 
   // Run Python script to compute 3D object coordinates
-  std::string pythonOutput = runPythonScript("../data/getting-3d-coords.py");
+  std::string pythonOutput = runPythonScript("../src/getting-3d-coords.py");
   if (!pythonOutput.empty())
   {
     ROS_INFO("[Python] Output:\n%s", pythonOutput.c_str());
@@ -1037,10 +1034,10 @@ int main(int argc, char **argv)
   ros::Publisher numericalAnswerPub = nh.advertise<std_msgs::Int32>("/numerical_response", 5);
   std_msgs::Int32 numericalResponseMsg;
 
-  // Publish raw LLM (Mistral) responses for visibility
-  ros::Publisher mistralResponsePub = nh.advertise<std_msgs::String>("/mistral_response", 5);
-  // Publish a consolidated final answer string for downstream consumers
-  ros::Publisher finalAnswerPub = nh.advertise<std_msgs::String>("/final_answer", 5);
+  // Publish raw LLM (Mistral) responses for visibility (latched so late subscribers can see last output)
+  ros::Publisher mistralResponsePub = nh.advertise<std_msgs::String>("/mistral_response", 5, true);
+  // Publish a consolidated final answer string for downstream consumers (latched ensures delivery before shutdown)
+  ros::Publisher finalAnswerPub = nh.advertise<std_msgs::String>("/final_answer", 5, true);
 
   // local alias for publishing waypoints inside this function
   ros::Publisher &waypointPub = g_waypointPub;
@@ -1124,6 +1121,8 @@ int main(int argc, char **argv)
     else
     {
       ROS_WARN("Mistral returned empty response in %.2fs", dt);
+      // Ensure we still publish a final answer to trigger shutdown of dependent nodes
+      mistralOut = ""; // keep empty for raw topic, we'll provide a fallback for final answer below
     }
     // Publish raw response to a topic for external verification/logging
     {
@@ -1207,7 +1206,8 @@ int main(int argc, char **argv)
     // Publish final consolidated answer and optionally shutdown
     {
       std_msgs::String finalMsg;
-      finalMsg.data = mistralOut;
+      // If Mistral returned empty, provide a minimal fallback message so subscribers react
+      finalMsg.data = !mistralOut.empty() ? mistralOut : std::string("done");
       finalAnswerPub.publish(finalMsg);
       ROS_INFO("Final answer published to /final_answer. %s", g_shutdownAfterAnswer ? "Shutting down." : "");
     }
@@ -1215,6 +1215,8 @@ int main(int argc, char **argv)
     g_frontierEnabled = false;
     if (g_shutdownAfterAnswer)
     {
+      // Give a brief moment for latched publications to flush to subscribers before shutdown
+      ros::Duration(0.25).sleep();
       ros::shutdown();
       break;
     }
