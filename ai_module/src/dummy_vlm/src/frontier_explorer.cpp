@@ -154,7 +154,9 @@ private:
         {
             ROS_WARN_THROTTLE(2.0, "FrontierExplorer: no frontiers; trying random exploration");
             geometry_msgs::Point rp;
-            if (computeRandomGoal(latest_map_, rx, ry, rp))
+            double cx = current_goal_active_ ? current_goal_.x : rx;
+            double cy = current_goal_active_ ? current_goal_.y : ry;
+            if (computeRandomGoal(latest_map_, cx, cy, rx, ry, rp))
             {
                 temp_goal_ = rp;
                 temp_goal_until_ = ros::Time::now() + ros::Duration(temp_hold_s_);
@@ -171,7 +173,9 @@ private:
         {
             ROS_WARN_THROTTLE(2.0, "FrontierExplorer: no suitable frontier goal; trying random exploration");
             geometry_msgs::Point rp;
-            if (computeRandomGoal(latest_map_, rx, ry, rp))
+            double cx = current_goal_active_ ? current_goal_.x : rx;
+            double cy = current_goal_active_ ? current_goal_.y : ry;
+            if (computeRandomGoal(latest_map_, cx, cy, rx, ry, rp))
             {
                 temp_goal_ = rp;
                 temp_goal_until_ = ros::Time::now() + ros::Duration(temp_hold_s_);
@@ -212,7 +216,9 @@ private:
             {
                 ROS_INFO_THROTTLE(2.0, "FrontierExplorer: candidate near recent goal; publishing random temp goal");
                 geometry_msgs::Point rp;
-                if (computeRandomGoal(latest_map_, rx, ry, rp))
+                double cx = current_goal_active_ ? current_goal_.x : rx;
+                double cy = current_goal_active_ ? current_goal_.y : ry;
+                if (computeRandomGoal(latest_map_, cx, cy, rx, ry, rp))
                 {
                     temp_goal_ = rp;
                     temp_goal_until_ = ros::Time::now() + ros::Duration(temp_hold_s_);
@@ -636,7 +642,8 @@ private:
         return false;
     }
 
-    bool computeRandomGoal(const nav_msgs::OccupancyGrid &map, double rx, double ry, geometry_msgs::Point &out)
+    // Sample a random reachable goal around a center (cx,cy) while validating from robot (rx,ry)
+    bool computeRandomGoal(const nav_msgs::OccupancyGrid &map, double cx, double cy, double rx, double ry, geometry_msgs::Point &out)
     {
         const double res = map.info.resolution;
         const double ox = map.info.origin.position.x;
@@ -656,8 +663,8 @@ private:
             double theta = ang_dist(rng_);
             for (int j = 0; j < 2; ++j)
             {
-                double qx = rx + random_step_m_ * std::cos(theta);
-                double qy = ry + random_step_m_ * std::sin(theta);
+                double qx = cx + random_step_m_ * std::cos(theta);
+                double qy = cy + random_step_m_ * std::sin(theta);
                 int r1 = static_cast<int>(std::floor((qy - oy) / res));
                 int c1 = static_cast<int>(std::floor((qx - ox) / res));
                 if (r1 >= 0 && r1 < h && c1 >= 0 && c1 < w)
@@ -676,6 +683,12 @@ private:
             }
         }
         return false;
+    }
+
+    // Backward-compatible helper: sample around the robot position
+    bool computeRandomGoal(const nav_msgs::OccupancyGrid &map, double rx, double ry, geometry_msgs::Point &out)
+    {
+        return computeRandomGoal(map, rx, ry, rx, ry, out);
     }
 
     double scorePoint(const nav_msgs::OccupancyGrid &map, double rx, double ry, const geometry_msgs::Point &p) const
