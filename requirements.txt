@@ -1,0 +1,2 @@
+# requirements.txt
+# All dependencies are installed via Dockerfile. No external Python packages required.
