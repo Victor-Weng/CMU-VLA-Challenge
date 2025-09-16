@@ -62,6 +62,8 @@ class CameraSaveAndDetect:
         self.image_dir_param = rospy.get_param('~image_dir', '')
         self.image_prefix = rospy.get_param('~image_prefix', 'image_')
         self.cleanup_images_on_startup = bool(rospy.get_param('~cleanup_images_on_startup', True))
+    # Shutdown when final answer is published
+    self.shutdown_on_final_answer = bool(rospy.get_param('~shutdown_on_final_answer', True))
 
         # Compute save path to match object_detection.py's default
         # object_detection.py lives in <pkg_dir>/src/object_detection.py
@@ -111,6 +113,8 @@ class CameraSaveAndDetect:
         if self.wait_for_question:
             self.q_sub = rospy.Subscriber(self.question_topic, String, self._on_question, queue_size=5)
             rospy.loginfo('camera_save_and_detect: waiting for first question on %s before activating', self.question_topic)
+        if self.shutdown_on_final_answer:
+            self.final_sub = rospy.Subscriber('/final_answer', String, self._on_final_answer, queue_size=1)
         self.sub = rospy.Subscriber(self.image_topic, Image, self.image_cb, queue_size=1, buff_size=2**24)
         rospy.loginfo('camera_save_and_detect: listening to %s', self.image_topic)
         rospy.loginfo('camera_save_and_detect: interval = %.2fs, model = %s', self.interval_sec, self.model)
@@ -120,6 +124,14 @@ class CameraSaveAndDetect:
             rospy.loginfo('camera_save_and_detect: primary save path = %s', self.save_path)
         if self.extra_compat_writes:
             rospy.loginfo('camera_save_and_detect: compat save paths = %s, %s', self.alt_save_path, self.alt2_save_path)
+
+    def _on_final_answer(self, _msg: String):
+        try:
+            rospy.loginfo('camera_save_and_detect: received /final_answer; shutting down this node')
+            self.activated = False
+            rospy.signal_shutdown('final answer received')
+        except Exception:
+            pass
 
     def image_cb(self, msg: Image):
         if not self.activated:

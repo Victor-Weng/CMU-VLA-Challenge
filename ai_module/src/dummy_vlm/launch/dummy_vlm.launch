@@ -48,10 +48,13 @@
   <arg name="paired_clear_delay_sec" default="2.0"/>
   <arg name="paired_also_clear_image" default="false"/>
   <arg name="paired_object_list_path" default="$(find dummy_vlm)/data/object_list_detect.txt"/>
+  <arg name="wait_for_question" default="true"/>
+  <arg name="shutdown_on_final_answer" default="true"/>
 
-  <node pkg="dummy_vlm" type="dummyVLM" name="dummyVLM" output="screen" respawn="true" respawn_delay="1.0">
+  <node pkg="dummy_vlm" type="dummyVLM" name="dummyVLM" output="screen" respawn="false">
     <param name="waypoint_file_dir" type="string" value="$(find dummy_vlm)/data/waypoints.ply" />
-    <param name="object_list_file_dir" type="string" value="$(find dummy_vlm)/data/object_list.txt" />
+  <!-- Use detection log by default; dummyVLM will skip structured read if this is used -->
+  <param name="object_list_file_dir" type="string" value="$(find dummy_vlm)/data/object_list_detect.txt" />
     <param name="waypointReachDis" type="double" value="1.0" />
     <param name="map_frame" value="$(arg map_frame)"/>
     <param name="robot_frame" value="$(arg robot_frame)"/>
@@ -77,6 +80,9 @@
     <param name="home_push_dist" value="$(arg home_push_dist)"/>
     <param name="home_go_timeout_sec" value="$(arg home_go_timeout_sec)"/>
     <param name="home_push_timeout_sec" value="$(arg home_push_timeout_sec)"/>
+    <!-- Ensure the node exits after answering one question -->
+    <param name="frontier_warmup_sec" value="20.0"/>
+    <param name="shutdown_after_answer" value="true"/>
   </node>
   <!-- Simple converter: /terrain_map (PointCloud2) -> /map (OccupancyGrid) -->
   <node pkg="dummy_vlm" type="pc_to_grid" name="pc_to_grid" output="screen">
@@ -136,6 +142,8 @@
     <param name="interval_sec" value="$(arg detect_interval_sec)"/>
     <param name="model" value="$(arg detect_model)"/>
     <param name="save_path" value="$(arg detect_save_path)"/>
+    <param name="wait_for_question" value="$(arg wait_for_question)"/>
+    <param name="shutdown_on_final_answer" value="$(arg shutdown_on_final_answer)"/>
   </node>
 
   <!-- Fuse paired image + point cloud: save image, run detection, estimate distance, append to object_list.txt -->
@@ -168,6 +176,8 @@
     <param name="clear_on_startup" value="$(arg paired_clear_on_startup)"/>
     <param name="clear_delay_sec" value="$(arg paired_clear_delay_sec)"/>
     <param name="also_clear_image" value="$(arg paired_also_clear_image)"/>
+    <param name="wait_for_question" value="$(arg wait_for_question)"/>
+    <param name="shutdown_on_final_answer" value="$(arg shutdown_on_final_answer)"/>
   </node>
 
 </launch>

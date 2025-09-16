@@ -104,6 +104,8 @@ class PairedDetectAndDepth:
         self.wait_for_question = bool(rospy.get_param('~wait_for_question', True))
         self.question_topic = rospy.get_param('~question_topic', '/challenge_question')
         self.activated = not self.wait_for_question
+    # Shutdown behavior: stop this node once a final answer is published
+    self.shutdown_on_final_answer = bool(rospy.get_param('~shutdown_on_final_answer', True))
         # Deduplication settings
         self.dedup_enabled = bool(rospy.get_param('~dedup_enabled', True))
         self.dedup_radius_m = float(rospy.get_param('~dedup_radius_m', 0.5))
@@ -169,6 +171,9 @@ class PairedDetectAndDepth:
         if self.wait_for_question:
             self.q_sub = rospy.Subscriber(self.question_topic, String, self._on_question, queue_size=5)
             rospy.loginfo('paired_detect_and_depth: waiting for first question on %s before activating', self.question_topic)
+        # Listen for final answer to gracefully shutdown this node (optional)
+        if self.shutdown_on_final_answer:
+            self.final_sub = rospy.Subscriber('/final_answer', String, self._on_final_answer, queue_size=1)
 
         # Optional cleanup and initialize sequence counter
         if self.cleanup_images_on_startup and self.sequential_saves:
@@ -192,6 +197,14 @@ class PairedDetectAndDepth:
             rospy.Timer(rospy.Duration(self.clear_delay_sec), self._delayed_clear_once, oneshot=True)
             rospy.loginfo('paired_detect_and_depth: will clear object list%s after %.1fs',
                           ' and image' if self.also_clear_image else '', self.clear_delay_sec)
+
+    def _on_final_answer(self, _msg: String):
+        try:
+            rospy.loginfo('paired_detect_and_depth: received /final_answer; shutting down this node')
+            self.activated = False
+            rospy.signal_shutdown('final answer received')
+        except Exception:
+            pass
 
     def pose_cb(self, msg: Odometry):
         try:

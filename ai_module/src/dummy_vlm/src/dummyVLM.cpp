@@ -148,6 +148,7 @@ static ros::Time g_goHomeStepDeadline;     // current step deadline
 static bool g_frontierWasRun = false;
 static double g_frontierWarmupSec = 20.0; // default warmup duration before answering
 static bool g_shutdownAfterAnswer = true; // stop node after answering by default
+static bool g_hasObjectInfo = false;      // whether structured object info was loaded
 
 // Helper: record (and de-dup) waypoint events
 static inline void recordWaypoint(const geometry_msgs::Pose2D &wp)
@@ -269,10 +270,20 @@ void readWaypointFile()
 // reading objects from file function
 void readObjectListFile()
 {
+  // If configured to point at detection log (new format), skip reading to avoid warnings
+  if (object_list_file_dir.find("object_list_detect.txt") != std::string::npos)
+  {
+    ROS_INFO("dummyVLM: object_list_file_dir points to detection log (%s); skipping structured object read",
+             object_list_file_dir.c_str());
+    g_hasObjectInfo = false;
+    return;
+  }
+
   FILE *object_list_file = fopen(object_list_file_dir.c_str(), "r");
   if (object_list_file == NULL)
   {
-    printf("\n[WARNING] dummyVLM: object_list file '%s' not found; skipping read.\n\n", object_list_file_dir.c_str());
+    ROS_INFO("dummyVLM: object_list file '%s' not found; skipping read.", object_list_file_dir.c_str());
+    g_hasObjectInfo = false;
     return;
   }
 
@@ -290,8 +301,9 @@ void readObjectListFile()
 
   if (val1 != 1 || val2 != 1 || val3 != 1 || val4 != 1 || val5 != 1 || val6 != 1 || val7 != 1 || val8 != 1 || val9 != 1)
   {
-    printf("\n[WARNING] dummyVLM: object_list file '%s' is malformed or empty; skipping read.\n\n", object_list_file_dir.c_str());
+    ROS_WARN("dummyVLM: object_list file '%s' is malformed or empty; skipping read.", object_list_file_dir.c_str());
     fclose(object_list_file);
+    g_hasObjectInfo = false;
     return;
   }
 
@@ -308,6 +320,7 @@ void readObjectListFile()
 
   for (int i = 1; s[i] != '"' && i < 100; i++)
     objLabel += s[i];
+  g_hasObjectInfo = true;
 }
 
 // Mistral API Function
@@ -1091,9 +1104,16 @@ int main(int argc, char **argv)
     else if (lowQ.find("find the") != std::string::npos)
     {
       // Object reference: highlight marker and navigate to object
-      delObjectMarker(objectMarkerPub, objectMarkerMsgs); // clear any previous
-      pubObjectMarker(objectMarkerPub, objectMarkerMsgs);
-      pubObjectWaypoint(waypointPub, waypointMsgs);
+      if (g_hasObjectInfo)
+      {
+        delObjectMarker(objectMarkerPub, objectMarkerMsgs); // clear any previous
+        pubObjectMarker(objectMarkerPub, objectMarkerMsgs);
+        pubObjectWaypoint(waypointPub, waypointMsgs);
+      }
+      else
+      {
+        ROS_WARN("Object-reference requested but no structured object info loaded; skipping navigation");
+      }
     }
     else
     {
