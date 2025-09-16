@@ -342,14 +342,32 @@ std::string askMistral(const std::string &question)
 
   std::string url = "https://api.mistral.ai/v1/chat/completions";
 
-  // Add your instructions here (raw string must end with )";)
-  std::string instructions = R"(You are going to be asked one of three types of questions and are provided a datasheet of information.
-  The datasheet provides the time, object name, x/y/z coordinates in space, and reference image names in that order. Use it to answer the questions as accurately as possible.
+  // Add your instructions here
+  std::string instructions = R"(You are going to provided a datasheet of information providing the time, object name, x/y/z coordinates in space, and reference image names in that order.
+  Use it to answer the following types of questions when prompted. Answer "How many ..." questions with only a singular integer. Answer "Find the ..." questions with only the image file corresponding to the correct unique object. Answer pathing questions by writing out a sequence of intever-valued coordinates moving only up/down/left/right to accomplish the asked task.)";
 
-  For "How many ..." questions, respond with only a single integer.
-  For "Find the ..." questions, respond with only the image file name of the correct unique object.
-  For pathing/instruction questions, output a sequence of integer (x,y) coordinates, one per line, moving only up/down/left/right.)";
 
+// Open the object list file
+std::ifstream file("../data/object_list_updated.txt");
+if (!file)
+{
+    std::cerr << "Failed to open ../data/object_list_updated.txt" << std::endl;
+}
+else
+{
+    std::stringstream buffer;
+    buffer << file.rdbuf();          // Read entire file
+    std::string object_list = buffer.str();
+
+    // Remove all newlines and carriage returns
+    object_list.erase(std::remove(object_list.begin(), object_list.end(), '\n'), object_list.end());
+    object_list.erase(std::remove(object_list.begin(), object_list.end(), '\r'), object_list.end());
+
+    // Append directly to instructions
+    instructions += object_list;
+}
+
+  
   std::string payload = R"({
         "model":"mistral-large-latest",
         "messages":[
