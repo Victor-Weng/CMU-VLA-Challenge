@@ -5,6 +5,7 @@ import sys
 import math
 import errno
 import subprocess
+import random
 
 import rospy
 from sensor_msgs.msg import Image, PointCloud2
@@ -65,6 +66,16 @@ class PairedDetectAndDepth:
         self.save_path = rospy.get_param('~save_path', '')  # default computed below
         self.object_list_path = rospy.get_param('~object_list_path', '')
         self.angle_window_deg = float(rospy.get_param('~angle_window_deg', 1.5))
+        # Adaptive depth windowing and fallbacks
+        self.depth_min_points = int(rospy.get_param('~depth_min_points', 20))
+        self.max_angle_window_deg = float(rospy.get_param('~max_angle_window_deg', 6.0))
+        self.depth_expand_factor = float(rospy.get_param('~depth_expand_factor', 1.6))
+        self.yaw_only_fallback = bool(rospy.get_param('~yaw_only_fallback', True))
+        self.yaw_only_tol_deg = float(rospy.get_param('~yaw_only_tol_deg', 4.0))
+        self.fallback_use_recent_label = bool(rospy.get_param('~fallback_use_recent_label', True))
+        self.random_fallback_enabled = bool(rospy.get_param('~random_fallback_enabled', True))
+        self.random_fallback_min_m = float(rospy.get_param('~random_fallback_min_m', 0.8))
+        self.random_fallback_max_m = float(rospy.get_param('~random_fallback_max_m', 3.0))
         # TF behavior: which timestamp to use for transform lookup: 'image' | 'cloud' | 'latest'
         self.tf_time_policy = rospy.get_param('~tf_time_policy', 'image')
         self.tf_use_latest_fallback = bool(rospy.get_param('~tf_use_latest_fallback', True))
@@ -351,25 +362,64 @@ class PairedDetectAndDepth:
 
         # Compute distances for each detection by angular windowing in camera frame (equirect model)
         H, W = cv_img.shape[:2]
-        win_yaw = math.radians(self.angle_window_deg)
-        win_pitch = math.radians(max(0.5 * self.angle_window_deg, 1.0))  # a bit wider vertically
+        win_yaw_base = math.radians(self.angle_window_deg)
+        win_pitch_base = math.radians(max(0.5 * self.angle_window_deg, 1.0))  # a bit wider vertically
+        win_yaw_max = math.radians(self.max_angle_window_deg)
+        win_pitch_max = math.radians(max(0.5 * self.max_angle_window_deg, 1.0))
+        yaw_only_tol = math.radians(self.yaw_only_tol_deg)
 
         results = []  # (label, u, v, dist_m)
         for label, u, v in dets:
-            if pts_cam is None:
-                # No TF -> no depth available
-                dist = float('nan')
-            else:
+            dist = float('nan')
+            used_mode = 'primary'
+            if pts_cam is not None:
                 yaw, pitch = self._equirect_ray(u, v, W, H)
-                dists = []
-                for (x, y, z) in pts_cam:
-                    # Direction angles of point from camera
-                    pyaw = math.atan2(y, x)
-                    horiz = math.hypot(x, y)
-                    ppitch = math.atan2(z, max(horiz, 1e-6))
-                    if self._ang_diff(pyaw, yaw) <= win_yaw and abs(ppitch - pitch) <= win_pitch:
-                        dists.append(math.sqrt(x * x + y * y + z * z))
-                dist = float(np.median(dists)) if dists else float('nan')
+                # Try adaptive expansion until we have enough points or max window reached
+                win_yaw = win_yaw_base
+                win_pitch = win_pitch_base
+                found_ct = 0
+                attempt = 0
+                while True:
+                    dists = []
+                    for (x, y, z) in pts_cam:
+                        pyaw = math.atan2(y, x)
+                        horiz = math.hypot(x, y)
+                        ppitch = math.atan2(z, max(horiz, 1e-6))
+                        if self._ang_diff(pyaw, yaw) <= win_yaw and abs(ppitch - pitch) <= win_pitch:
+                            dists.append(math.sqrt(x * x + y * y + z * z))
+                    found_ct = len(dists)
+                    if found_ct >= self.depth_min_points or (win_yaw >= win_yaw_max and win_pitch >= win_pitch_max):
+                        if found_ct > 0:
+                            dist = float(np.median(dists))
+                        break
+                    # Expand windows and try again
+                    win_yaw = min(win_yaw * self.depth_expand_factor, win_yaw_max)
+                    win_pitch = min(win_pitch * self.depth_expand_factor, win_pitch_max)
+                    attempt += 1
+
+                if math.isnan(dist) and self.yaw_only_fallback:
+                    # Yaw-only fallback: ignore pitch, accept more points
+                    dists = []
+                    for (x, y, z) in pts_cam:
+                        pyaw = math.atan2(y, x)
+                        if self._ang_diff(pyaw, yaw) <= yaw_only_tol:
+                            dists.append(math.sqrt(x * x + y * y + z * z))
+                    if dists:
+                        dist = float(np.median(dists))
+                        used_mode = 'yaw-only'
+
+            # Additional fallbacks if still NaN: reuse recent label distance or random within range
+            if math.isnan(dist) and self.fallback_use_recent_label:
+                prev = self._recent_distance_for_label(label, u, v)
+                if prev is not None and prev > 0:
+                    dist = float(prev)
+                    used_mode = 'recent-label'
+            if math.isnan(dist) and self.random_fallback_enabled:
+                dist = float(random.uniform(self.random_fallback_min_m, self.random_fallback_max_m))
+                used_mode = 'random'
+
+            if used_mode != 'primary':
+                rospy.loginfo('paired_detect_and_depth: depth fallback "%s" for %s at (%.1f,%.1f) -> %.2fm', used_mode, label, u, v, dist)
             results.append((label, u, v, dist))
 
         # Optionally deduplicate detections against recent history
@@ -467,6 +517,40 @@ class PairedDetectAndDepth:
             except Exception:
                 pass
         return removed
+
+    # ---------- Recent distance lookup for fallback ----------
+    def _recent_distance_for_label(self, label, u=None, v=None, lookback=500):
+        try:
+            with open(self.object_list_path, 'r') as f:
+                lines = f.readlines()
+        except Exception:
+            return None
+        start = max(0, len(lines) - lookback)
+        recent = reversed(lines[start:])
+        best = None
+        best_pix = float('inf')
+        for ln in recent:
+            parts = ln.strip().split('\t')
+            if len(parts) < 5:
+                continue
+            if parts[1] != label:
+                continue
+            try:
+                du = float(parts[2]); dv = float(parts[3]); dd = float(parts[4])
+            except Exception:
+                continue
+            if dd <= 0:
+                continue
+            if u is None or v is None:
+                return dd
+            # prefer closer pixel proximity
+            dp = abs(u - du) + abs(v - dv)
+            if dp < best_pix:
+                best_pix = dp
+                best = dd
+                if dp <= 40.0:
+                    break
+        return best
 
     # ---------- Dedup against existing log ----------
     def _dedup_filter(self, results, px, py):

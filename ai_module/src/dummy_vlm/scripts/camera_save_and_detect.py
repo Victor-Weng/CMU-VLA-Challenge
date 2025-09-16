@@ -206,16 +206,6 @@ class CameraSaveAndDetect:
         except Exception as e:
             rospy.logwarn('Failed to run detector: %s', str(e))
 
-
-def main():
-    rospy.init_node('camera_save_and_detect', anonymous=False)
-    node = CameraSaveAndDetect()
-    rospy.spin()
-
-
-if __name__ == '__main__':
-    main()
-
     # ---------- Helpers (instance methods) ----------
     def _init_seq_counter(self):
         # Determine next index based on existing files
@@ -253,6 +243,16 @@ if __name__ == '__main__':
                     os.remove(os.path.join(self.image_dir, name))
                 except Exception:
                     pass
+
+
+def main():
+    rospy.init_node('camera_save_and_detect', anonymous=False)
+    node = CameraSaveAndDetect()
+    rospy.spin()
+
+
+if __name__ == '__main__':
+    main()
 def _bytes_to_array(msg, channels):
     # Handle row stride (step) potentially > width*channels
     width = msg.width
