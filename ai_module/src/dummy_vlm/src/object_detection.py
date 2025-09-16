@@ -7,7 +7,7 @@ import sys
 
 def main():
     parser = argparse.ArgumentParser(description="Run YOLOv8 object detection on an image and print centers.")
-    parser.add_argument("image", nargs="?", help="Path to input image. Default: <repo_root>/data/image.jpg")
+    parser.add_argument("image", nargs="?", help="Path to input image. Default: <repo_root>/data/image.png")
     parser.add_argument("--model", default="yolov8n.pt", help="Path or name of YOLOv8 model (default: yolov8n.pt)")
     args = parser.parse_args()
 

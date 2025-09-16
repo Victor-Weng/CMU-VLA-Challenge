@@ -106,7 +106,7 @@ class CameraSaveAndDetect:
             pass
 
         if self.last_save_time.to_sec() > 0:
-            elapsed = (now - self.last_save_time).toSec()
+            elapsed = (now - self.last_save_time).to_sec()
             if elapsed < self.interval_sec:
                 rospy.logdebug('camera_save_and_detect: skipping save, %.2fs until next capture', self.interval_sec - elapsed)
                 return

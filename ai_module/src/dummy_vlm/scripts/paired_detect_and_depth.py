@@ -20,6 +20,33 @@ import tf
 import numpy as np
 import cv2
 
+# Predeclare helper so it's in scope before class uses it
+def _rosimg_to_cv2(msg):
+    enc = (msg.encoding or '').lower()
+    width = msg.width
+    height = msg.height
+    step = msg.step
+    buf = np.frombuffer(msg.data, dtype=np.uint8)
+    if enc in ('mono8', '8uc1'):
+        if step == width:
+            img = buf.reshape((height, width))
+        else:
+            img = buf.reshape((height, step))[:, :width]
+        return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    channels = 3
+    if step == width * channels:
+        img = buf.reshape((height, width, channels))
+    else:
+        img = buf.reshape((height, step))[:, :width * channels].reshape((height, width, channels))
+    if enc in ('rgb8', 'rgb16'):
+        return cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+    if enc in ('rgba8', 'bgra8'):
+        if enc.startswith('rgba'):
+            return cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
+        else:
+            return cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+    return img
+
 
 DET_LINE_RE = re.compile(r"^Detected\s+(?P<label>.+?)\s+at\s+center\s*\(\s*(?P<x>[-0-9.]+)\s*,\s*(?P<y>[-0-9.]+)\s*\)\s*$")
 
