@@ -9,3 +9,6 @@ system/unity/devel/
 .catkin_workspace
 *.pkl
 *.pth
+.env
+docker/.env
+docker/*.env

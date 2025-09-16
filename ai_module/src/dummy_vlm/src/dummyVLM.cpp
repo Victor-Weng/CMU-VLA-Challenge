@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ros/ros.h>
+#include <ros/package.h>
 #include <cstdlib>   // for system()
 #include <cstdio>    // for popen()
 #include <memory>    // for unique_ptr
@@ -89,7 +90,7 @@ static std::string runPythonScript(const std::string &scriptPath)
   std::string result;
 
   // Open a pipe to run Python
-  std::string cmd = std::string("python3 ") + scriptPath;
+  std::string cmd = std::string("python3 ") + scriptPath + " 2>&1"; // capture stderr too
   std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(cmd.c_str(), "r"), pclose);
 
   if (!pipe)
@@ -152,8 +153,10 @@ static ros::Time g_goHomeStepDeadline;     // current step deadline
 
 // Track whether we've run frontier at least once in this session
 static bool g_frontierWasRun = false;
-static double g_frontierWarmupSec = 20.0; // default warmup duration before answering
-static bool g_shutdownAfterAnswer = true; // stop node after answering by default
+static double g_frontierWarmupSec = 300.0; // default warmup duration before answering
+static bool g_shutdownAfterAnswer = true;  // stop node after answering by default
+// Optional API key provided via ROS param (fallback if env not set)
+static std::string g_mistralApiKey;
 // Clear detection log at first question if frontier has not run yet
 static bool g_clearDetectOnFreshSession = true;
 static std::string g_detectClearService = "/paired_detect_and_depth/clear_object_list";
@@ -347,15 +350,19 @@ std::string askMistral(const std::string &question)
 
   std::string url = "https://api.mistral.ai/v1/chat/completions";
 
-  // Add your instructions here
-  std::string instructions = R"(You are going to provided a datasheet of information providing the time, object name, x/y/z coordinates in space, and reference image names in that order.
-  Use it to answer the following types of questions when prompted. Answer "How many ..." questions with only a singular integer. Answer "Find the ..." questions with only the image file corresponding to the correct unique object. Answer pathing questions by writing out a sequence of intever-valued coordinates moving only up/down/left/right to accomplish the asked task.)";
+  // Prepare instructions text and attach detections
+  std::string instructions;
+  instructions += "You are given a datasheet of detections. Each row has: time, object label, x y z coordinates, image filename.\n";
+  instructions += "Answer rules:\n- For 'How many ...' -> respond with ONE integer, no extra text.\n- For 'Find the ...' -> respond with ONLY the image filename.\n- For pathing questions -> respond with a sequence of integer grid coordinates moving only up/down/left/right.\n\n";
+  instructions += "DATA START\n";
 
   // Open the object list file
-  std::ifstream file("../data/object_list_updated.txt");
+  // Resolve data file path via ROS package to avoid CWD issues
+  std::string dataPath = ros::package::getPath("dummy_vlm") + std::string("/data/object_list_updated.txt");
+  std::ifstream file(dataPath);
   if (!file)
   {
-    std::cerr << "Failed to open ../data/object_list_updated.txt" << std::endl;
+    std::cerr << "Failed to open " << dataPath << std::endl;
   }
   else
   {
@@ -363,39 +370,57 @@ std::string askMistral(const std::string &question)
     buffer << file.rdbuf(); // Read entire file
     std::string object_list = buffer.str();
 
-    // Remove all newlines and carriage returns
-    object_list.erase(std::remove(object_list.begin(), object_list.end(), '\n'), object_list.end());
-    object_list.erase(std::remove(object_list.begin(), object_list.end(), '\r'), object_list.end());
-
-    // Append directly to instructions
+    // Keep as-is with line breaks
     instructions += object_list;
   }
-
-  std::string payload = R"({
-        "model":"mistral-large-latest",
-        "messages":[
-            {"role":"system","content":")" +
-                        instructions + R"("},
-            {"role":"user","content":")" +
-                        question + R"("}
-        ]
-    })";
+  instructions += "\nDATA END\n";
+  // Build JSON payload safely
+  nlohmann::json payload;
+  payload["model"] = "mistral-large-latest";
+  payload["messages"] = nlohmann::json::array({nlohmann::json{{"role", "system"}, {"content", instructions}},
+                                               nlohmann::json{{"role", "user"}, {"content", question}}});
+  std::string payloadStr = payload.dump();
 
   struct curl_slist *headers = nullptr;
   headers = curl_slist_append(headers, "Content-Type: application/json");
-  headers = curl_slist_append(headers, "Authorization: Bearer OFgLAX07gC1v65hDAfeU4AoZNI9ehcMa");
+  std::string apiKeyStr;
+  if (const char *envKey = std::getenv("MISTRAL_API_KEY"))
+  {
+    apiKeyStr = envKey;
+  }
+  if (apiKeyStr.empty())
+  {
+    apiKeyStr = g_mistralApiKey; // fallback to ROS param if provided
+  }
+  if (apiKeyStr.empty())
+  {
+    std::cerr << "MISTRAL_API_KEY not set and ROS param ~/mistral_api_key empty; cannot call Mistral API." << std::endl;
+    curl_easy_cleanup(curl);
+    return "";
+  }
+  std::string authHeader = std::string("Authorization: Bearer ") + apiKeyStr;
+  headers = curl_slist_append(headers, authHeader.c_str());
 
   curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
   curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-  curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payload.c_str());
+  curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payloadStr.c_str());
+  curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, payloadStr.size());
   curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
   curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
 
   CURLcode res = curl_easy_perform(curl);
+  long http_code = 0;
+  curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
   if (res != CURLE_OK)
   {
     std::cerr << "Curl failed: " << curl_easy_strerror(res) << std::endl;
     response = "";
+  }
+  else if (http_code != 200)
+  {
+    std::cerr << "Mistral HTTP " << http_code << " body: "
+              << (response.size() ? response.substr(0, 512) : std::string("<empty>"))
+              << std::endl;
   }
 
   curl_slist_free_all(headers);
@@ -404,12 +429,35 @@ std::string askMistral(const std::string &question)
   // Parse JSON to get assistant content
   try
   {
-    auto j = json::parse(response);
-    return j["choices"][0]["message"]["content"];
+    auto j = nlohmann::json::parse(response, nullptr, false);
+    if (j.is_discarded())
+    {
+      std::cerr << "Failed to parse response (invalid JSON): "
+                << (response.size() ? response.substr(0, 512) : std::string("<empty>"))
+                << std::endl;
+      return "";
+    }
+    if (j.contains("choices") && j["choices"].is_array() && !j["choices"].empty())
+    {
+      const auto &msg = j["choices"][0]["message"];
+      if (msg.contains("content") && msg["content"].is_string())
+      {
+        return msg["content"].get<std::string>();
+      }
+    }
+    if (j.contains("error"))
+    {
+      std::cerr << "Mistral API error: " << j["error"].dump() << std::endl;
+    }
+    else
+    {
+      std::cerr << "Unexpected response: " << j.dump(2) << std::endl;
+    }
+    return "";
   }
-  catch (...)
+  catch (const std::exception &e)
   {
-    std::cerr << "Failed to parse response." << std::endl;
+    std::cerr << "Failed to parse response (exception): " << e.what() << std::endl;
     return "";
   }
 }
@@ -581,10 +629,16 @@ bool handleNavCommand(const std::string &q, ros::Publisher &waypointPub, geometr
   }
 
   // Run Python script to compute 3D object coordinates
-  std::string pythonOutput = runPythonScript("getting-3d-coords.py");
+  // Build absolute path to the script to avoid CWD issues
+  std::string scriptAbs = std::string(ros::package::getPath("dummy_vlm")) + "/src/getting-3d-coords.py";
+  std::string pythonOutput = runPythonScript(scriptAbs);
   if (!pythonOutput.empty())
   {
     ROS_INFO("[Python] Output:\n%s", pythonOutput.c_str());
+  }
+  else
+  {
+    ROS_WARN("[Python] getting-3d-coords.py produced no output. Check input files and paths.");
   }
 
   // Mistral API
@@ -1014,6 +1068,8 @@ int main(int argc, char **argv)
   nhPrivate.param("home_push_timeout_sec", g_homePushTimeoutSec, g_homePushTimeoutSec);
   nhPrivate.param("frontier_warmup_sec", g_frontierWarmupSec, g_frontierWarmupSec);
   nhPrivate.param("shutdown_after_answer", g_shutdownAfterAnswer, g_shutdownAfterAnswer);
+  // Optional: Mistral API key via ROS param as fallback to environment
+  nhPrivate.param<std::string>("mistral_api_key", g_mistralApiKey, std::string("r0zUJ6urp8Ae2wrCsoA32lfyyTR3pi3R"));
   nhPrivate.param("clear_detect_on_fresh_session", g_clearDetectOnFreshSession, g_clearDetectOnFreshSession);
   nhPrivate.param("detect_clear_service", g_detectClearService, g_detectClearService);
 
@@ -1106,6 +1162,32 @@ int main(int argc, char **argv)
       g_frontierEnabled = false;
       g_frontierWasRun = true;
       ROS_INFO("Frontier run complete; proceeding to answer.");
+    }
+
+    // Ensure 3D coords file is generated before calling Mistral
+    {
+      std::string pkgPath = ros::package::getPath("dummy_vlm");
+      std::string scriptAbs = pkgPath + "/src/getting-3d-coords.py";
+      std::string dataPath = pkgPath + "/data/object_list_updated.txt";
+      std::string pyOut = runPythonScript(scriptAbs);
+      if (!pyOut.empty())
+      {
+        ROS_INFO("[Python] getting-3d-coords.py output:\n%s", pyOut.c_str());
+      }
+      // If the output file still doesn't exist, create an empty one to avoid open failures
+      std::ifstream testFile(dataPath);
+      if (!testFile)
+      {
+        std::ofstream createFile(dataPath);
+        if (createFile)
+        {
+          ROS_WARN("Created empty 3D coords file at %s (no detections yet)", dataPath.c_str());
+        }
+        else
+        {
+          ROS_WARN("Could not create 3D coords file at %s", dataPath.c_str());
+        }
+      }
     }
 
     // Call Mistral with the question text (log timing and publish raw output)

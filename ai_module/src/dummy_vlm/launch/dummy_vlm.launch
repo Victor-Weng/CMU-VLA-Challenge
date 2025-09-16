@@ -4,6 +4,8 @@
   <arg name="map_frame" default="map"/>
   <arg name="robot_frame" default="sensor"/>
   <arg name="robot_pose_topic" default="/state_estimation"/>
+  <!-- API key handling: read from environment and pass as a private ROS param -->
+  <arg name="mistral_api_key" default="$(env MISTRAL_API_KEY)"/>
   <!-- Go-home recovery options -->
   <arg name="go_home_on_long_stagnation" default="true"/>
   <arg name="long_stagnation_sec" default="10.0"/>
@@ -55,6 +57,8 @@
     <param name="waypoint_file_dir" type="string" value="$(find dummy_vlm)/data/waypoints.ply" />
   <!-- Use detection log by default; dummyVLM will skip structured read if this is used -->
   <param name="object_list_file_dir" type="string" value="$(find dummy_vlm)/data/object_list_detect.txt" />
+    <!-- Provide Mistral API key as a private param (~mistral_api_key) -->
+    <param name="mistral_api_key" value="$(arg mistral_api_key)"/>
     <param name="waypointReachDis" type="double" value="1.0" />
     <param name="map_frame" value="$(arg map_frame)"/>
     <param name="robot_frame" value="$(arg robot_frame)"/>

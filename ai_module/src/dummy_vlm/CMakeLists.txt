@@ -3,6 +3,7 @@ project(dummy_vlm)
 
 find_package(catkin REQUIRED COMPONENTS
   roscpp
+  roslib
   std_msgs
   std_srvs
   sensor_msgs
