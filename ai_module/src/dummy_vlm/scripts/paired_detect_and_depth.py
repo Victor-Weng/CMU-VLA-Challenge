@@ -19,6 +19,7 @@ import message_filters
 import tf
 import numpy as np
 import cv2
+from std_srvs.srv import Trigger, TriggerResponse
 
 # Predeclare helper so it's in scope before class uses it
 def _rosimg_to_cv2(msg):
@@ -63,6 +64,9 @@ class PairedDetectAndDepth:
         # TF behavior: which timestamp to use for transform lookup: 'image' | 'cloud' | 'latest'
         self.tf_time_policy = rospy.get_param('~tf_time_policy', 'image')
         self.tf_use_latest_fallback = bool(rospy.get_param('~tf_use_latest_fallback', True))
+    # Reset/clear behavior
+    self.clear_on_startup = bool(rospy.get_param('~clear_on_startup', False))
+    self.also_clear_image = bool(rospy.get_param('~also_clear_image', False))
 
         # Resolve default paths
         this_dir = os.path.dirname(os.path.abspath(__file__))  # <pkg>/scripts
@@ -89,6 +93,8 @@ class PairedDetectAndDepth:
         self.detector_script = os.path.join(objdet_dir, 'object_detection.py')
         self.bridge = CvBridge() if CvBridge is not None else None
         self.tf_listener = tf.TransformListener()
+    # Advertise service to allow clearing while running
+    self.clear_srv = rospy.Service('~clear_object_list', Trigger, self.on_clear)
 
         # Subscribers with synchronization
         img_sub = message_filters.Subscriber(self.image_topic, Image, queue_size=5)
@@ -98,6 +104,40 @@ class PairedDetectAndDepth:
 
         rospy.loginfo('paired_detect_and_depth: listening to %s and %s', self.image_topic, self.points_topic)
         rospy.loginfo('paired_detect_and_depth: saving images to %s, detections to %s', self.save_path, self.object_list_path)
+        if self.clear_on_startup:
+            self._clear_files()
+            rospy.loginfo('paired_detect_and_depth: cleared object list%s on startup',
+                          ' and image' if self.also_clear_image else '')
+
+    def on_clear(self, _req):
+        try:
+            self._clear_files()
+            msg = f"Cleared {self.object_list_path}"
+            if self.also_clear_image:
+                msg += f" and {self.save_path}"
+            rospy.loginfo('paired_detect_and_depth: %s', msg)
+            return TriggerResponse(success=True, message=msg)
+        except Exception as e:
+            emsg = f"Clear failed: {e}"
+            rospy.logwarn('paired_detect_and_depth: %s', emsg)
+            return TriggerResponse(success=False, message=emsg)
+
+    def _clear_files(self):
+        # Ensure directories exist then truncate object list
+        try:
+            os.makedirs(os.path.dirname(self.object_list_path), exist_ok=True)
+        except Exception:
+            pass
+        with open(self.object_list_path, 'w'):
+            pass
+        if self.also_clear_image:
+            try:
+                # Truncate if exists, else ensure path
+                os.makedirs(os.path.dirname(self.save_path), exist_ok=True)
+                with open(self.save_path, 'w'):
+                    pass
+            except Exception:
+                pass
 
     def on_pair(self, img_msg: Image, pc_msg: PointCloud2):
         stamp = img_msg.header.stamp

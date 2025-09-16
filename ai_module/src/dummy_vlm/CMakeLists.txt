@@ -44,5 +44,6 @@ add_dependencies(image_lidar_capture ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catki
 catkin_install_python(PROGRAMS
   scripts/camera_save_and_detect.py
   scripts/paired_detect_and_depth.py
+  scripts/clear_object_list.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
