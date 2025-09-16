@@ -116,6 +116,9 @@ static double g_homeGoTimeoutSec = 20.0;   // seconds timeout to reach home
 static double g_homePushTimeoutSec = 10.0; // seconds timeout to complete push-out
 static ros::Time g_goHomeStepDeadline;     // current step deadline
 
+// Track whether we've run frontier at least once in this session
+static bool g_frontierWasRun = false;
+
 // Helper: record (and de-dup) waypoint events
 static inline void recordWaypoint(const geometry_msgs::Pose2D &wp)
 {
@@ -166,6 +169,7 @@ void nextGoalCb(const geometry_msgs::PoseStamped::ConstPtr &msg)
   g_waypointPub.publish(out);
   g_lastNextGoal = ros::Time::now();
   g_lastBridgedGoal = g_lastNextGoal;
+  g_frontierWasRun = true; // record that frontier has been active
 
   // Track for stagnation detection
   recordWaypoint(out);
@@ -977,36 +981,104 @@ int main(int argc, char **argv)
     ros::spinOnce();
     if (question.empty())
     {
+      rate.sleep();
+      status = ros::ok();
       continue;
     }
-    if (question.rfind("Find", 0) == 0 || question.rfind("find", 0) == 0)
+
+    // We have a question; ensure frontier has run before answering
+    if (!g_frontierWasRun)
     {
-      ROS_INFO("Marking and navigating to object.");
-      printf("[dummyVLM] Received 'Find' question: %s\n", question.c_str());
-      pubObjectMarker(objectMarkerPub, objectMarkerMsgs);
-      pubObjectWaypoint(waypointPub, waypointMsgs);
+      ROS_INFO("Frontier has not been run yet; running for 5 minutes before answering.");
+      g_frontierEnabled = true;
+      ros::Time start = ros::Time::now();
+      ros::Duration horizon(300.0); // 5 minutes
+      while (ros::ok() && (ros::Time::now() - start) < horizon)
+      {
+        ros::spinOnce();
+        rate.sleep();
+      }
+      g_frontierEnabled = false;
+      g_frontierWasRun = true;
+      ROS_INFO("Frontier run complete; proceeding to answer.");
     }
-    else if (question.rfind("How many", 0) == 0 || question.rfind("how many", 0) == 0)
+
+    // Call Mistral with the question text
+    std::string mistralOut = askMistral(question);
+    if (!mistralOut.empty())
     {
-      delObjectMarker(objectMarkerPub, objectMarkerMsgs);
-      int32_t number = (rand() % 10) + 1;
-      printf("[dummyVLM] Received 'How many' question: %s\n", question.c_str());
-      ROS_INFO("%d", number);
-      pubNumericalAnswer(numericalAnswerPub, numericalResponseMsg, number);
-    }
-    // custom navigation
-    else if (handleNavCommand(question, waypointPub, waypointMsgs, rate))
-    {
-      ROS_INFO("Navigation command handled.");
+      ROS_INFO("Mistral says: %s", mistralOut.c_str());
     }
     else
     {
-      delObjectMarker(objectMarkerPub, objectMarkerMsgs);
-      printf("[dummyVLM] Received other question: %s\n", question.c_str());
-      ROS_INFO("Navigation starts.");
-      pubPathWaypoints(waypointPub, waypointMsgs, rate);
-      ROS_INFO("Navigation ends.");
+      ROS_WARN("Mistral returned empty response.");
     }
+
+    // Very simple trigger-based action routing
+    std::string lowQ = question;
+    std::transform(lowQ.begin(), lowQ.end(), lowQ.begin(), ::tolower);
+    if (lowQ.find("how many") != std::string::npos)
+    {
+      // Numerical type: Expect an integer; print and publish
+      // Try to parse an int from mistralOut; fallback to 0
+      int val = 0;
+      try
+      {
+        val = std::stoi(mistralOut);
+      }
+      catch (...)
+      {
+        // leave val=0
+      }
+      printf("[dummyVLM] Numerical answer: %d\n", val);
+      pubNumericalAnswer(numericalAnswerPub, numericalResponseMsg, val);
+    }
+    else if (lowQ.find("find the") != std::string::npos)
+    {
+      // Object reference: highlight marker and navigate to object
+      delObjectMarker(objectMarkerPub, objectMarkerMsgs); // clear any previous
+      pubObjectMarker(objectMarkerPub, objectMarkerMsgs);
+      pubObjectWaypoint(waypointPub, waypointMsgs);
+    }
+    else
+    {
+      // Instruction-following (default): send path/waypoints
+      pubPathWaypoints(waypointPub, waypointMsgs, rate);
+    }
+
+    // Print the required JSON schema for documentation/logging
+    const char *schema = R"({
+  "question_types": {
+    "numerical": {
+      "trigger": "how many",
+      "response_type": "Int32",
+      "ros_topic": "/numerical_response",
+      "action": "Print number to terminal and publish to ROS topic",
+      "used_by_system": false
+    },
+    "object_reference": {
+      "trigger": "find the",
+      "response_type": "Marker",
+      "ros_topic": "/selected_object_marker",
+      "action": "Highlight object with visualization marker and navigate to its center",
+      "used_by_system": true
+    },
+    "instruction_following": {
+      "trigger": "default",
+      "response_type": "Pose2D[]",
+      "ros_topic": "/way_point_with_heading",
+      "action": "Send series of fixed waypoints for navigation",
+      "used_by_system": true
+    }
+  },
+  "notes": {
+    "images": "No image saving or publishing required during evaluation",
+    "waypoints": "Waypoints are published live to ROS; no need to save to disk",
+    "terminal": "Numerical answers should be printed to terminal for logging; other types may log debug info"
+  }
+})";
+    ROS_INFO("Question handling schema:%s\n%s", "", schema);
+
     question.clear();
     ROS_INFO("Awaiting question...");
   }
