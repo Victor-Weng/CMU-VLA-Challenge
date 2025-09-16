@@ -22,6 +22,11 @@
 
 // ADD: we use PoseStamped for frontier goal bridging
 #include <geometry_msgs/PoseStamped.h>
+#include <curl/curl.h>
+#include <nlohmann/json.hpp>
+
+using json = nlohmann::json;
+
 
 using namespace std;
 
@@ -241,6 +246,60 @@ void readObjectListFile()
     objLabel += s[i];
 }
 
+
+//Mistral API Function
+// Callback for curl to write response data
+static size_t WriteCallback(void* contents, size_t size, size_t nmemb, void* userp) {
+    ((std::string*)userp)->append((char*)contents, size * nmemb);
+    return size * nmemb;
+}
+
+// Function to send a question to Mistral and get the response
+std::string askMistral(const std::string& question) {
+    std::string response;
+
+    CURL* curl = curl_easy_init();
+    if (!curl) {
+        std::cerr << "Failed to initialize curl." << std::endl;
+        return "";
+    }
+
+    std::string url = "https://api.mistral.ai/v1/chat/completions";
+    std::string payload = R"({"model":"mistral-large-latest","messages":[{"role":"user","content":")"
+                          + question + "\"}]}";
+
+    struct curl_slist* headers = nullptr;
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+    headers = curl_slist_append(headers, "Authorization: Bearer OFgLAX07gC1v65hDAfeU4AoZNI9ehcMa");
+
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payload.c_str());
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+
+    CURLcode res = curl_easy_perform(curl);
+    if (res != CURLE_OK) {
+        std::cerr << "Curl failed: " << curl_easy_strerror(res) << std::endl;
+        response = "";
+    }
+
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+
+    // Parse JSON to get assistant content
+    try {
+        auto j = json::parse(response);
+        return j["choices"][0]["message"]["content"];
+    } catch (...) {
+        std::cerr << "Failed to parse response." << std::endl;
+        return "";
+    }
+}
+
+
+
+
 // handle navigator commands (to be replaced by LLM later)
 // Parse and execute simple nav commands
 //   1) "goto x y [theta]"  -> publish a single waypoint to (x, y) with optional theta
@@ -406,6 +465,15 @@ bool handleNavCommand(const std::string &q, ros::Publisher &waypointPub, geometr
     waypointHeading = oldH;
     return true;
   }
+  //Mistral API
+  //Print the mistral api output with ROS-INFO
+
+  std::string mistralOutput = askMistral(s);
+    if (!mistralOutput.empty())
+    {
+        ROS_INFO("Mistral says: %s", mistralOutput.c_str());
+        return true;
+    }
   return false;
 }
 
