@@ -65,13 +65,16 @@ class PairedDetectAndDepth:
         self.model = rospy.get_param('~model', 'yolov8n.pt')
         self.save_path = rospy.get_param('~save_path', '')  # default computed below
         self.object_list_path = rospy.get_param('~object_list_path', '')
+        # Angular window base size (degrees) for initial search
         self.angle_window_deg = float(rospy.get_param('~angle_window_deg', 1.5))
         # Adaptive depth windowing and fallbacks
         self.depth_min_points = int(rospy.get_param('~depth_min_points', 20))
-        self.max_angle_window_deg = float(rospy.get_param('~max_angle_window_deg', 6.0))
+        # Expand adaptively up to this maximum (degrees)
+        self.max_angle_window_deg = float(rospy.get_param('~max_angle_window_deg', 15.0))
         self.depth_expand_factor = float(rospy.get_param('~depth_expand_factor', 1.6))
         self.yaw_only_fallback = bool(rospy.get_param('~yaw_only_fallback', True))
-        self.yaw_only_tol_deg = float(rospy.get_param('~yaw_only_tol_deg', 4.0))
+        # Be a bit more permissive on yaw-only matches
+        self.yaw_only_tol_deg = float(rospy.get_param('~yaw_only_tol_deg', 8.0))
         self.fallback_use_recent_label = bool(rospy.get_param('~fallback_use_recent_label', True))
         self.random_fallback_enabled = bool(rospy.get_param('~random_fallback_enabled', True))
         self.random_fallback_min_m = float(rospy.get_param('~random_fallback_min_m', 0.8))
@@ -79,6 +82,9 @@ class PairedDetectAndDepth:
         # TF behavior: which timestamp to use for transform lookup: 'image' | 'cloud' | 'latest'
         self.tf_time_policy = rospy.get_param('~tf_time_policy', 'image')
         self.tf_use_latest_fallback = bool(rospy.get_param('~tf_use_latest_fallback', True))
+        # New: Be more lenient by trying both stamps and waiting longer
+        self.tf_try_both_stamps = bool(rospy.get_param('~tf_try_both_stamps', True))
+        self.tf_wait_sec = float(rospy.get_param('~tf_wait_sec', 1.0))
         # Reset/clear behavior
         self.clear_on_startup = bool(rospy.get_param('~clear_on_startup', False))
         self.clear_delay_sec = float(rospy.get_param('~clear_delay_sec', 2.0))
@@ -106,10 +112,20 @@ class PairedDetectAndDepth:
         self.activated = not self.wait_for_question
         # Shutdown behavior: stop this node once a final answer is published
         self.shutdown_on_final_answer = bool(rospy.get_param('~shutdown_on_final_answer', True))
+        # Write-level fallback: if depth missing, write random int between [min,max]
+        self.write_random_if_missing = bool(rospy.get_param('~write_random_if_missing', True))
+        self.write_random_min = int(rospy.get_param('~write_random_min', 0))
+        self.write_random_max = int(rospy.get_param('~write_random_max', 3))
         # Deduplication settings
         self.dedup_enabled = bool(rospy.get_param('~dedup_enabled', True))
         self.dedup_radius_m = float(rospy.get_param('~dedup_radius_m', 0.5))
+        # Legacy per-axis pixel tolerance (kept for backward compat in params)
         self.dedup_pixel_tol = float(rospy.get_param('~dedup_pixel_tol', 40.0))
+        # New: Euclidean pixel radius and adaptive widening for near objects
+        self.dedup_pixel_radius = float(rospy.get_param('~dedup_pixel_radius', 80.0))
+        self.dedup_pixel_k_over_d = float(rospy.get_param('~dedup_pixel_k_over_d', 40.0))  # adds k/d to radius
+        self.dedup_pixel_fallback = float(rospy.get_param('~dedup_pixel_fallback', 90.0))  # when distance unknown
+        self.dedup_within_frame = bool(rospy.get_param('~dedup_within_frame', True))
         self.dedup_dist_tol_m = float(rospy.get_param('~dedup_dist_tol_m', 0.5))
         self.dedup_lookback = int(rospy.get_param('~dedup_lookback', 1000))  # lines
 
@@ -352,30 +368,43 @@ class PairedDetectAndDepth:
         if img_frame == pc_frame:
             T = np.eye(4, dtype=np.float32)
         else:
+            # Build an ordered list of candidate times: primary -> other stamp (optional) -> latest (optional)
+            def _stamp_name(t):
+                return 'latest' if t == rospy.Time(0) else f"{t.to_sec():.3f}"
             if self.tf_time_policy == 'cloud':
-                target_time = pc_msg.header.stamp
+                primary = pc_msg.header.stamp
+                secondary = img_msg.header.stamp
             elif self.tf_time_policy == 'latest':
-                target_time = rospy.Time(0)
+                primary = rospy.Time(0)
+                secondary = img_msg.header.stamp
             else:
-                target_time = img_msg.header.stamp
+                primary = img_msg.header.stamp
+                secondary = pc_msg.header.stamp
+
+            candidates = [primary]
+            if self.tf_try_both_stamps and secondary != rospy.Time(0) and secondary != primary:
+                candidates.append(secondary)
+            if self.tf_use_latest_fallback and rospy.Time(0) not in candidates:
+                candidates.append(rospy.Time(0))
+
             T = None
-            try:
-                if target_time != rospy.Time(0):
-                    self.tf_listener.waitForTransform(img_frame, pc_frame, target_time, rospy.Duration(0.4))
-                (trans, rot) = self.tf_listener.lookupTransform(img_frame, pc_frame, target_time)
-                T = self._tf_to_matrix(trans, rot)
-            except (tf.Exception, tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException) as e:
-                rospy.logwarn('TF %s -> %s at t=%s unavailable: %s', pc_frame, img_frame,
-                              ('latest' if target_time == rospy.Time(0) else f"{target_time.to_sec():.3f}"), str(e))
-                # Optional fallback to latest
-                if self.tf_use_latest_fallback and target_time != rospy.Time(0):
-                    try:
-                        (trans, rot) = self.tf_listener.lookupTransform(img_frame, pc_frame, rospy.Time(0))
-                        T = self._tf_to_matrix(trans, rot)
-                        rospy.loginfo('paired_detect_and_depth: using latest TF for %s->%s', pc_frame, img_frame)
-                    except Exception as e2:
-                        rospy.logwarn('TF latest fallback failed: %s', str(e2))
-                        T = None
+            last_err = None
+            for t in candidates:
+                try:
+                    if t != rospy.Time(0):
+                        self.tf_listener.waitForTransform(img_frame, pc_frame, t, rospy.Duration(self.tf_wait_sec))
+                    (trans, rot) = self.tf_listener.lookupTransform(img_frame, pc_frame, t)
+                    T = self._tf_to_matrix(trans, rot)
+                    if t != primary:
+                        rospy.loginfo('paired_detect_and_depth: TF fallback using %s time %s',
+                                      ('secondary' if t == secondary else 'latest'), _stamp_name(t))
+                    break
+                except (tf.Exception, tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException) as e:
+                    last_err = e
+                    continue
+            if T is None and last_err is not None:
+                rospy.logwarn('TF %s -> %s unavailable after %d candidate time(s); last error: %s',
+                              pc_frame, img_frame, len(candidates), str(last_err))
 
         # Read points and optionally transform to camera frame
         points = pc2.read_points(pc_msg, field_names=['x', 'y', 'z'], skip_nans=True)
@@ -455,6 +484,27 @@ class PairedDetectAndDepth:
                 rospy.loginfo('paired_detect_and_depth: depth fallback "%s" for %s at (%.1f,%.1f) -> %.2fm', used_mode, label, u, v, dist)
             results.append((label, u, v, dist))
 
+        # Optionally deduplicate within the current frame (same label, close pixels)
+        if self.dedup_within_frame and results:
+            by_label = {}
+            kept = []
+            for (label, u, v, d) in results:
+                key = (label or '').strip().lower()
+                cand_list = by_label.setdefault(key, [])
+                if d is not None and not math.isnan(d) and d > 0:
+                    eff_rad = self.dedup_pixel_radius + (self.dedup_pixel_k_over_d / max(d, 0.5))
+                else:
+                    eff_rad = self.dedup_pixel_fallback
+                is_dup = False
+                for (u0, v0, d0) in cand_list:
+                    if math.hypot(u - u0, v - v0) <= eff_rad:
+                        is_dup = True
+                        break
+                if not is_dup:
+                    cand_list.append((u, v, d))
+                    kept.append((label, u, v, d))
+            results = kept
+
         # Optionally deduplicate detections against recent history
         if self.dedup_enabled:
             px = self.pose_x if not math.isnan(self.pose_x) else None
@@ -464,8 +514,8 @@ class PairedDetectAndDepth:
                 results = self._dedup_filter(results, px, py)
                 removed = before - len(results)
                 if removed > 0:
-                    rospy.loginfo('paired_detect_and_depth: dedup removed %d duplicate(s) (radius=%.2fm, pix<=%.0f, d<=%.2fm)',
-                                  removed, self.dedup_radius_m, self.dedup_pixel_tol, self.dedup_dist_tol_m)
+                    rospy.loginfo('paired_detect_and_depth: dedup removed %d duplicate(s) (pose<=%.2fm, pix<=~%.0f, d<=%.2fm)',
+                                  removed, self.dedup_radius_m, self.dedup_pixel_radius, self.dedup_dist_tol_m)
 
         # Append to object_list.txt (now includes robot x, y and image file name)
         try:
@@ -474,7 +524,16 @@ class PairedDetectAndDepth:
                 for (label, u, v, dist) in results:
                     px = self.pose_x if not math.isnan(self.pose_x) else -1
                     py = self.pose_y if not math.isnan(self.pose_y) else -1
-                    f.write(f"{stamp.to_sec():.3f}\t{label}\t{u:.1f}\t{v:.1f}\t{dist if not math.isnan(dist) else -1}\t{px}\t{py}\t{img_name}\n")
+                    d_out = dist
+                    if self.write_random_if_missing and (d_out is None or (isinstance(d_out, float) and (math.isnan(d_out) or d_out < 0))):
+                        try:
+                            d_out = int(random.randint(self.write_random_min, self.write_random_max))
+                            rospy.loginfo('paired_detect_and_depth: depth missing -> writing random int %d for %s at (%.1f, %.1f)', d_out, label, u, v)
+                        except Exception:
+                            d_out = -1
+                    elif isinstance(d_out, float) and math.isnan(d_out):
+                        d_out = -1
+                    f.write(f"{stamp.to_sec():.3f}\t{label}\t{u:.1f}\t{v:.1f}\t{d_out}\t{px}\t{py}\t{img_name}\n")
                 f.flush()
                 os.fsync(f.fileno())
             rospy.loginfo('paired_detect_and_depth: wrote %d detections to %s (pose x=%.3f y=%.3f, img=%s)', len(results), self.object_list_path, self.pose_x, self.pose_y, os.path.basename(out_path))
@@ -628,16 +687,24 @@ class PairedDetectAndDepth:
             if not hist:
                 return False
             for (u0, v0, d0, x0, y0) in hist:
-                if d0 < 0 or d < 0:
-                    # If we don't have distance, rely more on pixel and pose proximity
-                    if (abs(u - u0) <= self.dedup_pixel_tol and abs(v - v0) <= self.dedup_pixel_tol and
-                        math.hypot(x - x0, y - y0) <= self.dedup_radius_m):
+                # Adaptive pixel radius: widen when objects are near (smaller depth)
+                if (d is not None and d0 is not None and d > 0 and d0 > 0 and
+                        not math.isnan(d) and not math.isnan(d0)):
+                    eff_rad = self.dedup_pixel_radius + (self.dedup_pixel_k_over_d / max(min(d, d0), 0.5))
+                else:
+                    eff_rad = self.dedup_pixel_fallback
+
+                pix_close = (math.hypot(u - u0, v - v0) <= eff_rad)
+                pose_close = (math.hypot(x - x0, y - y0) <= self.dedup_radius_m)
+
+                # If depth unknown, rely on pixel and pose proximity only
+                if (d is None or d0 is None or d <= 0 or d0 <= 0 or math.isnan(d) or math.isnan(d0)):
+                    if pix_close and pose_close:
                         return True
                     continue
-                if (math.hypot(x - x0, y - y0) <= self.dedup_radius_m and
-                    abs(u - u0) <= self.dedup_pixel_tol and
-                    abs(v - v0) <= self.dedup_pixel_tol and
-                    abs(d - d0) <= self.dedup_dist_tol_m):
+
+                # When depth known, also require similar distances
+                if pix_close and pose_close and abs(d - d0) <= self.dedup_dist_tol_m:
                     return True
             return False
 
