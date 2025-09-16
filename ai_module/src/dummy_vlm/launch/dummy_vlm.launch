@@ -26,6 +26,11 @@
   <!-- Paired detection + depth fusion config -->
   <arg name="paired_detect_model" default="yolov8n.pt"/>
   <arg name="paired_detect_save_path" default="/home/victor/CMU-VLA-Challenge/ai_module/src/data/image.png"/>
+  <arg name="paired_image_dir" default="/home/victor/CMU-VLA-Challenge/ai_module/src/data"/>
+  <arg name="paired_image_prefix" default="image_"/>
+  <arg name="paired_sequential_saves" default="true"/>
+  <arg name="paired_cleanup_images_on_startup" default="false"/>
+  <arg name="paired_write_latest_copy" default="true"/>
   <arg name="paired_angle_window_deg" default="1.5"/>
   <arg name="paired_tf_time_policy" default="latest"/>
   <arg name="paired_tf_use_latest_fallback" default="true"/>
@@ -129,6 +134,11 @@
     <param name="points_topic" value="/paired/points"/>
     <param name="model" value="$(arg paired_detect_model)"/>
     <param name="save_path" value="$(arg paired_detect_save_path)"/>
+    <param name="image_dir" value="$(arg paired_image_dir)"/>
+    <param name="image_prefix" value="$(arg paired_image_prefix)"/>
+    <param name="sequential_saves" value="$(arg paired_sequential_saves)"/>
+    <param name="cleanup_images_on_startup" value="$(arg paired_cleanup_images_on_startup)"/>
+    <param name="write_latest_copy" value="$(arg paired_write_latest_copy)"/>
     <param name="object_list_path" value="$(arg paired_object_list_path)"/>
     <param name="angle_window_deg" value="$(arg paired_angle_window_deg)"/>
     <param name="tf_time_policy" value="$(arg paired_tf_time_policy)"/>

@@ -69,6 +69,12 @@ class PairedDetectAndDepth:
         self.clear_on_startup = bool(rospy.get_param('~clear_on_startup', False))
         self.clear_delay_sec = float(rospy.get_param('~clear_delay_sec', 2.0))
         self.also_clear_image = bool(rospy.get_param('~also_clear_image', False))
+        # Sequential saving behavior
+        self.sequential_saves = bool(rospy.get_param('~sequential_saves', True))
+        self.image_dir_param = rospy.get_param('~image_dir', '')
+        self.image_prefix = rospy.get_param('~image_prefix', 'image_')
+        self.cleanup_images_on_startup = bool(rospy.get_param('~cleanup_images_on_startup', False))
+        self.write_latest_copy = bool(rospy.get_param('~write_latest_copy', True))
 
         # Resolve default paths
         this_dir = os.path.dirname(os.path.abspath(__file__))  # <pkg>/scripts
@@ -84,8 +90,15 @@ class PairedDetectAndDepth:
             pkg_data_dir = os.path.join(pkg_dir, 'data')
             self.object_list_path = os.path.join(pkg_data_dir, 'object_list_detect.txt')
 
+        # Derive image directory and extension for sequential saves
+        self.image_ext = os.path.splitext(self.save_path)[1].lower() or '.png'
+        if self.image_dir_param:
+            self.image_dir = self.image_dir_param
+        else:
+            self.image_dir = os.path.dirname(self.save_path) or data_dir
+
         # Ensure dirs exist
-        for d in [os.path.dirname(self.save_path), os.path.dirname(self.object_list_path)]:
+        for d in [self.image_dir, os.path.dirname(self.object_list_path)]:
             try:
                 os.makedirs(d)
             except OSError as e:
@@ -104,8 +117,18 @@ class PairedDetectAndDepth:
         sync = message_filters.ApproximateTimeSynchronizer([img_sub, pc_sub], queue_size=10, slop=0.10)
         sync.registerCallback(self.on_pair)
 
+        # Optional cleanup and initialize sequence counter
+        if self.cleanup_images_on_startup and self.sequential_saves:
+            self._cleanup_images()
+        self._init_seq_counter()
+
         rospy.loginfo('paired_detect_and_depth: listening to %s and %s', self.image_topic, self.points_topic)
-        rospy.loginfo('paired_detect_and_depth: saving images to %s, detections to %s', self.save_path, self.object_list_path)
+        if self.sequential_saves:
+            rospy.loginfo('paired_detect_and_depth: sequential images to dir=%s prefix=%s ext=%s (start index=%d); latest copy -> %s',
+                          self.image_dir, self.image_prefix, self.image_ext, getattr(self, 'seq_index', 1), self.save_path if self.write_latest_copy else '(disabled)')
+        else:
+            rospy.loginfo('paired_detect_and_depth: saving image to %s', self.save_path)
+        rospy.loginfo('paired_detect_and_depth: detections to %s', self.object_list_path)
         if self.clear_on_startup:
             # Delay clear a bit to avoid racing with other nodes (e.g., dummyVLM) that may read on startup
             rospy.Timer(rospy.Duration(self.clear_delay_sec), self._delayed_clear_once, oneshot=True)
@@ -141,7 +164,7 @@ class PairedDetectAndDepth:
         if self.also_clear_image:
             try:
                 # Truncate if exists, else ensure path
-                os.makedirs(os.path.dirname(self.save_path), exist_ok=True)
+                os.makedirs(self.image_dir, exist_ok=True)
                 with open(self.save_path, 'w'):
                     pass
             except Exception:
@@ -164,24 +187,39 @@ class PairedDetectAndDepth:
             if cv_img is None:
                 rospy.logwarn('Failed to convert image without cv_bridge')
                 return
+        # Decide output path (sequential or single)
+        if self.sequential_saves:
+            out_path = self._next_image_path()
+        else:
+            out_path = self.save_path
         try:
             import cv2
             ok = False
-            ext = os.path.splitext(self.save_path.lower())[1]
+            ext = os.path.splitext(out_path.lower())[1]
             if ext == '.png':
-                ok = cv2.imwrite(self.save_path, cv_img, [int(cv2.IMWRITE_PNG_COMPRESSION), 3])
+                ok = cv2.imwrite(out_path, cv_img, [int(cv2.IMWRITE_PNG_COMPRESSION), 3])
             else:
-                ok = cv2.imwrite(self.save_path, cv_img, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+                ok = cv2.imwrite(out_path, cv_img, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
             if not ok:
-                rospy.logwarn('Failed to write image to %s', self.save_path)
+                rospy.logwarn('Failed to write image to %s', out_path)
                 return
+            # Optionally also write a latest copy to self.save_path for compatibility
+            if self.write_latest_copy and out_path != self.save_path:
+                try:
+                    ext2 = os.path.splitext(self.save_path.lower())[1]
+                    if ext2 == '.png':
+                        cv2.imwrite(self.save_path, cv_img, [int(cv2.IMWRITE_PNG_COMPRESSION), 3])
+                    else:
+                        cv2.imwrite(self.save_path, cv_img, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+                except Exception as _e:
+                    rospy.logdebug('Could not update latest image copy at %s: %s', self.save_path, str(_e))
         except Exception as e:
             rospy.logwarn('Exception saving image: %s', str(e))
             return
 
         # Run detector script on saved image and parse output
         py = sys.executable or 'python3'
-        cmd = [py, self.detector_script, self.save_path, '--model', self.model]
+    cmd = [py, self.detector_script, out_path, '--model', self.model]
         rospy.loginfo('paired_detect_and_depth: running detector: %s', ' '.join(cmd))
         dets = []  # list of (label, u, v)
         try:
@@ -285,6 +323,43 @@ class PairedDetectAndDepth:
             rospy.loginfo('paired_detect_and_depth: wrote %d detections to %s', len(results), self.object_list_path)
         except Exception as e:
             rospy.logwarn('Failed writing object list: %s', str(e))
+
+    # ---------- Helpers for sequential saving ----------
+    def _init_seq_counter(self):
+        if not self.sequential_saves:
+            self.seq_index = 1
+            return
+        try:
+            files = os.listdir(self.image_dir)
+        except Exception:
+            files = []
+        max_idx = 0
+        pref = self.image_prefix
+        for name in files:
+            if not name.startswith(pref) or not name.endswith(self.image_ext):
+                continue
+            num = name[len(pref):-len(self.image_ext)] if len(self.image_ext) > 0 else name[len(pref):]
+            if num.isdigit():
+                max_idx = max(max_idx, int(num))
+        self.seq_index = max_idx + 1
+
+    def _next_image_path(self):
+        name = f"{self.image_prefix}{self.seq_index:06d}{self.image_ext}"
+        self.seq_index += 1
+        return os.path.join(self.image_dir, name)
+
+    def _cleanup_images(self):
+        try:
+            files = os.listdir(self.image_dir)
+        except Exception:
+            return
+        pref = self.image_prefix
+        for name in files:
+            if name.startswith(pref) and name.endswith(self.image_ext):
+                try:
+                    os.remove(os.path.join(self.image_dir, name))
+                except Exception:
+                    pass
 
     @staticmethod
     def _tf_to_matrix(trans, rot):

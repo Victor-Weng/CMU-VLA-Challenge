@@ -194,7 +194,7 @@ class CameraSaveAndDetect:
 
         # Run detector as a subprocess
         py = sys.executable or 'python3'
-    cmd = [py, self.detector_script, out_path, '--model', self.model]
+        cmd = [py, self.detector_script, out_path, '--model', self.model]
         rospy.loginfo('Running detector command: %s', ' '.join(cmd))
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
