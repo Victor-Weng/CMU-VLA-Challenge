@@ -8,6 +8,7 @@ import subprocess
 
 import rospy
 from sensor_msgs.msg import Image, PointCloud2
+from nav_msgs.msg import Odometry
 try:
     from cv_bridge import CvBridge, CvBridgeError
 except Exception:
@@ -20,6 +21,8 @@ import tf
 import numpy as np
 import cv2
 from std_srvs.srv import Trigger, TriggerResponse
+from geometry_msgs.msg import PoseStamped
+from std_msgs.msg import String
 
 # Predeclare helper so it's in scope before class uses it
 def _rosimg_to_cv2(msg):
@@ -75,6 +78,23 @@ class PairedDetectAndDepth:
         self.image_prefix = rospy.get_param('~image_prefix', 'image_')
         self.cleanup_images_on_startup = bool(rospy.get_param('~cleanup_images_on_startup', False))
         self.write_latest_copy = bool(rospy.get_param('~write_latest_copy', True))
+        # Pose topic for logging robot position
+        self.robot_pose_topic = rospy.get_param('~robot_pose_topic', '/state_estimation')
+        # Frontier-triggered cleanup settings
+        self.cleanup_on_frontier_start = bool(rospy.get_param('~cleanup_on_frontier_start', True))
+        self.cleanup_include_latest = bool(rospy.get_param('~cleanup_include_latest', True))
+        self.frontier_goal_topic = rospy.get_param('~frontier_goal_topic', '/next_goal')
+        self.cleanup_exts_csv = rospy.get_param('~cleanup_exts', 'png,jpg,jpeg')
+        self.cleanup_exts = [('.' + e.strip().lower()) for e in self.cleanup_exts_csv.split(',') if e.strip()]
+        # "specific" command interface
+        self.specific_enabled = bool(rospy.get_param('~specific_enabled', True))
+        self.specific_cmd_topic = rospy.get_param('~specific_cmd_topic', '/vlm_command')
+        # Deduplication settings
+        self.dedup_enabled = bool(rospy.get_param('~dedup_enabled', True))
+        self.dedup_radius_m = float(rospy.get_param('~dedup_radius_m', 0.5))
+        self.dedup_pixel_tol = float(rospy.get_param('~dedup_pixel_tol', 40.0))
+        self.dedup_dist_tol_m = float(rospy.get_param('~dedup_dist_tol_m', 0.5))
+        self.dedup_lookback = int(rospy.get_param('~dedup_lookback', 1000))  # lines
 
         # Resolve default paths
         this_dir = os.path.dirname(os.path.abspath(__file__))  # <pkg>/scripts
@@ -108,6 +128,9 @@ class PairedDetectAndDepth:
         self.detector_script = os.path.join(objdet_dir, 'object_detection.py')
         self.bridge = CvBridge() if CvBridge is not None else None
         self.tf_listener = tf.TransformListener()
+        # Latest pose cache
+        self.pose_x = float('nan')
+        self.pose_y = float('nan')
         # Advertise service to allow clearing while running
         self.clear_srv = rospy.Service('~clear_object_list', Trigger, self.on_clear)
 
@@ -116,6 +139,17 @@ class PairedDetectAndDepth:
         pc_sub = message_filters.Subscriber(self.points_topic, PointCloud2, queue_size=5)
         sync = message_filters.ApproximateTimeSynchronizer([img_sub, pc_sub], queue_size=10, slop=0.10)
         sync.registerCallback(self.on_pair)
+        # Robot pose subscriber
+        self.pose_sub = rospy.Subscriber(self.robot_pose_topic, Odometry, self.pose_cb, queue_size=5)
+        # Frontier goal subscriber (one-shot cleanup when it starts publishing)
+        self.did_frontier_cleanup = False
+        if self.cleanup_on_frontier_start:
+            self.frontier_sub = rospy.Subscriber(self.frontier_goal_topic, PoseStamped, self._on_frontier_signal, queue_size=1)
+        # Specific command subscriber
+        self._pending_specific = []  # list of object names requested
+        self.last_image_path = ''    # last saved image path
+        if self.specific_enabled:
+            self.spec_sub = rospy.Subscriber(self.specific_cmd_topic, String, self._on_specific_cmd, queue_size=5)
 
         # Optional cleanup and initialize sequence counter
         if self.cleanup_images_on_startup and self.sequential_saves:
@@ -128,12 +162,34 @@ class PairedDetectAndDepth:
                           self.image_dir, self.image_prefix, self.image_ext, getattr(self, 'seq_index', 1), self.save_path if self.write_latest_copy else '(disabled)')
         else:
             rospy.loginfo('paired_detect_and_depth: saving image to %s', self.save_path)
-        rospy.loginfo('paired_detect_and_depth: detections to %s', self.object_list_path)
+            rospy.loginfo('paired_detect_and_depth: detections to %s', self.object_list_path)
+        if self.cleanup_on_frontier_start:
+            rospy.loginfo('paired_detect_and_depth: will cleanup images in %s on first frontier goal publish (exts=%s, include_latest=%s) listening on %s',
+                          self.image_dir, ','.join(self.cleanup_exts), str(self.cleanup_include_latest), self.frontier_goal_topic)
+        if self.specific_enabled:
+            rospy.loginfo('paired_detect_and_depth: listening for specific commands on %s (format: "specific <obj1>[, obj2, ...]")', self.specific_cmd_topic)
         if self.clear_on_startup:
             # Delay clear a bit to avoid racing with other nodes (e.g., dummyVLM) that may read on startup
             rospy.Timer(rospy.Duration(self.clear_delay_sec), self._delayed_clear_once, oneshot=True)
             rospy.loginfo('paired_detect_and_depth: will clear object list%s after %.1fs',
                           ' and image' if self.also_clear_image else '', self.clear_delay_sec)
+
+    def pose_cb(self, msg: Odometry):
+        try:
+            self.pose_x = float(msg.pose.pose.position.x)
+            self.pose_y = float(msg.pose.pose.position.y)
+        except Exception:
+            pass
+
+    def _on_frontier_signal(self, _msg: PoseStamped):
+        if self.did_frontier_cleanup:
+            return
+        self.did_frontier_cleanup = True
+        try:
+            removed = self._cleanup_all_images_in_dir()
+            rospy.loginfo('paired_detect_and_depth: frontier active; cleaned %d images in %s', removed, self.image_dir)
+        except Exception as e:
+            rospy.logwarn('paired_detect_and_depth: cleanup on frontier start failed: %s', str(e))
 
     def _delayed_clear_once(self, _evt):
         self._clear_files()
@@ -217,9 +273,12 @@ class PairedDetectAndDepth:
             rospy.logwarn('Exception saving image: %s', str(e))
             return
 
+        # Remember last image path for any subsequent "specific" commands
+        self.last_image_path = out_path
+
         # Run detector script on saved image and parse output
         py = sys.executable or 'python3'
-    cmd = [py, self.detector_script, out_path, '--model', self.model]
+        cmd = [py, self.detector_script, out_path, '--model', self.model]
         rospy.loginfo('paired_detect_and_depth: running detector: %s', ' '.join(cmd))
         dets = []  # list of (label, u, v)
         try:
@@ -313,16 +372,41 @@ class PairedDetectAndDepth:
                 dist = float(np.median(dists)) if dists else float('nan')
             results.append((label, u, v, dist))
 
-        # Append to object_list.txt
+        # Optionally deduplicate detections against recent history
+        if self.dedup_enabled:
+            px = self.pose_x if not math.isnan(self.pose_x) else None
+            py = self.pose_y if not math.isnan(self.pose_y) else None
+            if px is not None and py is not None:
+                before = len(results)
+                results = self._dedup_filter(results, px, py)
+                removed = before - len(results)
+                if removed > 0:
+                    rospy.loginfo('paired_detect_and_depth: dedup removed %d duplicate(s) (radius=%.2fm, pix<=%.0f, d<=%.2fm)',
+                                  removed, self.dedup_radius_m, self.dedup_pixel_tol, self.dedup_dist_tol_m)
+
+        # Append to object_list.txt (now includes robot x, y and image file name)
         try:
             with open(self.object_list_path, 'a') as f:
+                img_name = os.path.basename(out_path)
                 for (label, u, v, dist) in results:
-                    f.write(f"{stamp.to_sec():.3f}\t{label}\t{u:.1f}\t{v:.1f}\t{dist if not math.isnan(dist) else -1}\n")
+                    px = self.pose_x if not math.isnan(self.pose_x) else -1
+                    py = self.pose_y if not math.isnan(self.pose_y) else -1
+                    f.write(f"{stamp.to_sec():.3f}\t{label}\t{u:.1f}\t{v:.1f}\t{dist if not math.isnan(dist) else -1}\t{px}\t{py}\t{img_name}\n")
                 f.flush()
                 os.fsync(f.fileno())
-            rospy.loginfo('paired_detect_and_depth: wrote %d detections to %s', len(results), self.object_list_path)
+            rospy.loginfo('paired_detect_and_depth: wrote %d detections to %s (pose x=%.3f y=%.3f, img=%s)', len(results), self.object_list_path, self.pose_x, self.pose_y, os.path.basename(out_path))
         except Exception as e:
             rospy.logwarn('Failed writing object list: %s', str(e))
+        # If we have a pending "specific" request, render and save filtered boxes now
+        if self._pending_specific and self.last_image_path:
+            try:
+                targets = self._pending_specific[:]  # copy
+                self._pending_specific = []
+                outs = self._render_specific_bboxes(self.last_image_path, targets)
+                if outs:
+                    rospy.loginfo('paired_detect_and_depth: wrote specific outputs: %s', ', '.join(outs))
+            except Exception as e:
+                rospy.logwarn('paired_detect_and_depth: specific render failed: %s', str(e))
 
     # ---------- Helpers for sequential saving ----------
     def _init_seq_counter(self):
@@ -360,6 +444,162 @@ class PairedDetectAndDepth:
                     os.remove(os.path.join(self.image_dir, name))
                 except Exception:
                     pass
+
+    def _cleanup_all_images_in_dir(self):
+        try:
+            files = os.listdir(self.image_dir)
+        except Exception:
+            return 0
+        removed = 0
+        for name in files:
+            lower = name.lower()
+            if any(lower.endswith(ext) for ext in self.cleanup_exts):
+                p = os.path.join(self.image_dir, name)
+                try:
+                    os.remove(p)
+                    removed += 1
+                except Exception:
+                    pass
+        if self.cleanup_include_latest and os.path.isfile(self.save_path):
+            try:
+                os.remove(self.save_path)
+                removed += 1
+            except Exception:
+                pass
+        return removed
+
+    # ---------- Dedup against existing log ----------
+    def _dedup_filter(self, results, px, py):
+        # results: list of (label, u, v, dist)
+        # Read last N lines from object_list_path and summarize by label
+        try:
+            with open(self.object_list_path, 'r') as f:
+                lines = f.readlines()
+        except Exception:
+            lines = []
+        start = max(0, len(lines) - self.dedup_lookback)
+        recent = lines[start:]
+        by_label = {}
+        for ln in recent:
+            parts = ln.strip().split('\t')
+            if len(parts) < 5:
+                continue
+            label = parts[1]
+            try:
+                u0 = float(parts[2]); v0 = float(parts[3]); d0 = float(parts[4])
+            except Exception:
+                continue
+            # Optional pose columns (added recently)
+            pxx = None; pyy = None
+            if len(parts) >= 7:
+                try:
+                    pxx = float(parts[5]); pyy = float(parts[6])
+                except Exception:
+                    pxx = None; pyy = None
+            if pxx is None or pyy is None:
+                # Skip entries without pose; not enough info for spatial dedup
+                continue
+            by_label.setdefault(label, []).append((u0, v0, d0, pxx, pyy))
+
+        def is_dup(label, u, v, d, x, y):
+            hist = by_label.get(label)
+            if not hist:
+                return False
+            for (u0, v0, d0, x0, y0) in hist:
+                if d0 < 0 or d < 0:
+                    # If we don't have distance, rely more on pixel and pose proximity
+                    if (abs(u - u0) <= self.dedup_pixel_tol and abs(v - v0) <= self.dedup_pixel_tol and
+                        math.hypot(x - x0, y - y0) <= self.dedup_radius_m):
+                        return True
+                    continue
+                if (math.hypot(x - x0, y - y0) <= self.dedup_radius_m and
+                    abs(u - u0) <= self.dedup_pixel_tol and
+                    abs(v - v0) <= self.dedup_pixel_tol and
+                    abs(d - d0) <= self.dedup_dist_tol_m):
+                    return True
+            return False
+
+        filtered = []
+        for (label, u, v, d) in results:
+            if is_dup(label, u, v, d, px, py):
+                rospy.logdebug('Dedup: skipping %s at (u=%.1f,v=%.1f,d=%.2f) near prior', label, u, v, d)
+                continue
+            filtered.append((label, u, v, d))
+        return filtered
+
+    # ---------- Specific command handling ----------
+    def _on_specific_cmd(self, msg: String):
+        text = (msg.data or '').strip()
+        low = text.lower()
+        if not low.startswith('specific'):
+            return
+        rest = text[len('specific'):].strip()
+        if not rest:
+            # Placeholder default
+            self._pending_specific = ['chair']
+            rospy.loginfo('paired_detect_and_depth: specific command received with no targets; defaulting to %s', self._pending_specific)
+            return
+        # Split by commas or spaces
+        tokens = [t.strip() for t in re.split(r'[ ,]+', rest) if t.strip()]
+        self._pending_specific = tokens
+        rospy.loginfo('paired_detect_and_depth: specific targets set to %s', self._pending_specific)
+
+    def _render_specific_bboxes(self, image_path: str, obj_names):
+        try:
+            from ultralytics import YOLO
+        except Exception as e:
+            rospy.logwarn('ultralytics not available for specific rendering: %s', str(e))
+            return []
+        obj_names = [s.strip() for s in obj_names if s and s.strip()]
+        if not obj_names:
+            return []
+        # Load model and run inference
+        model = YOLO(self.model)
+        results = model(image_path)
+        if not results:
+            rospy.loginfo('specific: no results from model')
+            return []
+        res = results[0]
+        names = getattr(res, 'names', {}) or {}
+        # Prepare outputs dir at same level as data dir
+        parent = os.path.dirname(self.image_dir)  # e.g., <...>/ai_module/src
+        out_dir = os.path.join(parent, 'outputs')
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+        except Exception:
+            pass
+        # Load image
+        base_img = cv2.imread(image_path)
+        if base_img is None:
+            rospy.logwarn('specific: failed to load image at %s', image_path)
+            return []
+
+        # Build a per-object annotated image
+        written = []
+        for target in obj_names:
+            target_low = target.lower()
+            img = base_img.copy()
+            any_box = False
+            if res.boxes is not None and len(res.boxes) > 0:
+                for box, cls_id in zip(res.boxes.xyxy, res.boxes.cls):
+                    label = names.get(int(cls_id), str(int(cls_id)))
+                    if label.lower() != target_low:
+                        continue
+                    x1, y1, x2, y2 = [int(v) for v in box]
+                    color = (0, 255, 0)
+                    cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
+                    cv2.putText(img, label, (x1, max(0, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
+                    any_box = True
+            # Write output image even if no boxes (as an explicit result)
+            out_path = os.path.join(out_dir, f"{target}.png")
+            try:
+                cv2.imwrite(out_path, img)
+                written.append(out_path)
+            except Exception:
+                pass
+            if not any_box:
+                rospy.loginfo('specific: no boxes for target %s in %s', target, os.path.basename(image_path))
+        return written
 
     @staticmethod
     def _tf_to_matrix(trans, rot):

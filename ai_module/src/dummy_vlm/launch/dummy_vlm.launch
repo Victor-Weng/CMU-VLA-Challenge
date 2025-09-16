@@ -31,6 +31,16 @@
   <arg name="paired_sequential_saves" default="true"/>
   <arg name="paired_cleanup_images_on_startup" default="false"/>
   <arg name="paired_write_latest_copy" default="true"/>
+  <arg name="paired_cleanup_on_frontier_start" default="true"/>
+  <arg name="paired_cleanup_include_latest" default="true"/>
+  <arg name="paired_cleanup_exts" default="png,jpg,jpeg"/>
+  <arg name="paired_specific_enabled" default="true"/>
+  <arg name="paired_specific_cmd_topic" default="/vlm_command"/>
+  <arg name="paired_dedup_enabled" default="true"/>
+  <arg name="paired_dedup_radius_m" default="0.5"/>
+  <arg name="paired_dedup_pixel_tol" default="40.0"/>
+  <arg name="paired_dedup_dist_tol_m" default="0.5"/>
+  <arg name="paired_dedup_lookback" default="1000"/>
   <arg name="paired_angle_window_deg" default="1.5"/>
   <arg name="paired_tf_time_policy" default="latest"/>
   <arg name="paired_tf_use_latest_fallback" default="true"/>
@@ -132,6 +142,7 @@
   <node pkg="dummy_vlm" type="paired_detect_and_depth.py" name="paired_detect_and_depth" output="screen">
     <param name="image_topic" value="/paired/image"/>
     <param name="points_topic" value="/paired/points"/>
+  <param name="robot_pose_topic" value="$(arg robot_pose_topic)"/>
     <param name="model" value="$(arg paired_detect_model)"/>
     <param name="save_path" value="$(arg paired_detect_save_path)"/>
     <param name="image_dir" value="$(arg paired_image_dir)"/>
@@ -139,6 +150,17 @@
     <param name="sequential_saves" value="$(arg paired_sequential_saves)"/>
     <param name="cleanup_images_on_startup" value="$(arg paired_cleanup_images_on_startup)"/>
     <param name="write_latest_copy" value="$(arg paired_write_latest_copy)"/>
+  <param name="cleanup_on_frontier_start" value="$(arg paired_cleanup_on_frontier_start)"/>
+  <param name="cleanup_include_latest" value="$(arg paired_cleanup_include_latest)"/>
+  <param name="cleanup_exts" value="$(arg paired_cleanup_exts)"/>
+  <param name="frontier_goal_topic" value="/next_goal"/>
+  <param name="specific_enabled" value="$(arg paired_specific_enabled)"/>
+  <param name="specific_cmd_topic" value="$(arg paired_specific_cmd_topic)"/>
+  <param name="dedup_enabled" value="$(arg paired_dedup_enabled)"/>
+  <param name="dedup_radius_m" value="$(arg paired_dedup_radius_m)"/>
+  <param name="dedup_pixel_tol" value="$(arg paired_dedup_pixel_tol)"/>
+  <param name="dedup_dist_tol_m" value="$(arg paired_dedup_dist_tol_m)"/>
+  <param name="dedup_lookback" value="$(arg paired_dedup_lookback)"/>
     <param name="object_list_path" value="$(arg paired_object_list_path)"/>
     <param name="angle_window_deg" value="$(arg paired_angle_window_deg)"/>
     <param name="tf_time_policy" value="$(arg paired_tf_time_policy)"/>

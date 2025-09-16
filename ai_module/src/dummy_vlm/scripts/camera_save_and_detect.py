@@ -216,7 +216,7 @@ def main():
 if __name__ == '__main__':
     main()
 
-# ---------- Helpers ----------
+    # ---------- Helpers (instance methods) ----------
     def _init_seq_counter(self):
         # Determine next index based on existing files
         if not self.sequential_saves:
