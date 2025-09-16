@@ -49,7 +49,8 @@ def _rosimg_to_cv2(msg):
     return img
 
 
-DET_LINE_RE = re.compile(r"^Detected\s+(?P<label>.+?)\s+at\s+center\s*\(\s*(?P<x>[-0-9.]+)\s*,\s*(?P<y>[-0-9.]+)\s*\)\s*$")
+# Accept extra suffix after the center coords (e.g., 'with avg RGB ...')
+DET_LINE_RE = re.compile(r"Detected\s+(?P<label>.+?)\s+at\s+center\s*\(\s*(?P<x>[-0-9.]+)\s*,\s*(?P<y>[-0-9.]+)\s*\)")
 
 
 class PairedDetectAndDepth:
@@ -66,6 +67,7 @@ class PairedDetectAndDepth:
         self.tf_use_latest_fallback = bool(rospy.get_param('~tf_use_latest_fallback', True))
         # Reset/clear behavior
         self.clear_on_startup = bool(rospy.get_param('~clear_on_startup', False))
+        self.clear_delay_sec = float(rospy.get_param('~clear_delay_sec', 2.0))
         self.also_clear_image = bool(rospy.get_param('~also_clear_image', False))
 
         # Resolve default paths
@@ -77,10 +79,10 @@ class PairedDetectAndDepth:
         default_image_path = os.path.join(data_dir, 'image.png')
         if not self.save_path:
             self.save_path = default_image_path
-        # Default object_list to package data dir
+        # Default object_list to a separate detections file to avoid clobbering dummyVLM's object_list.txt format
         if not self.object_list_path:
             pkg_data_dir = os.path.join(pkg_dir, 'data')
-            self.object_list_path = os.path.join(pkg_data_dir, 'object_list.txt')
+            self.object_list_path = os.path.join(pkg_data_dir, 'object_list_detect.txt')
 
         # Ensure dirs exist
         for d in [os.path.dirname(self.save_path), os.path.dirname(self.object_list_path)]:
@@ -105,9 +107,15 @@ class PairedDetectAndDepth:
         rospy.loginfo('paired_detect_and_depth: listening to %s and %s', self.image_topic, self.points_topic)
         rospy.loginfo('paired_detect_and_depth: saving images to %s, detections to %s', self.save_path, self.object_list_path)
         if self.clear_on_startup:
-            self._clear_files()
-            rospy.loginfo('paired_detect_and_depth: cleared object list%s on startup',
-                          ' and image' if self.also_clear_image else '')
+            # Delay clear a bit to avoid racing with other nodes (e.g., dummyVLM) that may read on startup
+            rospy.Timer(rospy.Duration(self.clear_delay_sec), self._delayed_clear_once, oneshot=True)
+            rospy.loginfo('paired_detect_and_depth: will clear object list%s after %.1fs',
+                          ' and image' if self.also_clear_image else '', self.clear_delay_sec)
+
+    def _delayed_clear_once(self, _evt):
+        self._clear_files()
+        rospy.loginfo('paired_detect_and_depth: cleared object list%s (delayed start)',
+                      ' and image' if self.also_clear_image else '')
 
     def on_clear(self, _req):
         try:
@@ -181,7 +189,7 @@ class PairedDetectAndDepth:
             for line in proc.stdout:
                 line = line.strip()
                 rospy.loginfo('[detector] %s', line)
-                m = DET_LINE_RE.match(line)
+                m = DET_LINE_RE.search(line)
                 if m:
                     label = m.group('label')
                     u = float(m.group('x'))
@@ -230,23 +238,19 @@ class PairedDetectAndDepth:
 
         # Read points and optionally transform to camera frame
         points = pc2.read_points(pc_msg, field_names=['x', 'y', 'z'], skip_nans=True)
-        pts_cam = []
+        pts_cam = None
         if T is None:
-            rospy.logwarn('paired_detect_and_depth: skipping fusion due to missing TF between %s and %s', pc_frame, img_frame)
-            return
+            rospy.logwarn('paired_detect_and_depth: TF between %s and %s unavailable; will write detections without depth', pc_frame, img_frame)
         else:
             # Transform all points to camera frame using numpy for speed
             arr = np.fromiter(points, dtype=[('x', 'f4'), ('y', 'f4'), ('z', 'f4')])
             if arr.size == 0:
+                rospy.loginfo('paired_detect_and_depth: point cloud empty after transform; will write detections without depth')
                 pts_cam = []
             else:
                 xyz = np.vstack((arr['x'], arr['y'], arr['z'], np.ones(arr.size, dtype=np.float32)))  # 4xN
                 cam = T.dot(xyz)  # 4xN
                 pts_cam = list(zip(cam[0, :].tolist(), cam[1, :].tolist(), cam[2, :].tolist()))
-
-        if not pts_cam:
-            rospy.loginfo('paired_detect_and_depth: point cloud empty after transform')
-            return
 
         # Compute distances for each detection by angular windowing in camera frame (equirect model)
         H, W = cv_img.shape[:2]
@@ -255,19 +259,20 @@ class PairedDetectAndDepth:
 
         results = []  # (label, u, v, dist_m)
         for label, u, v in dets:
-            yaw, pitch = self._equirect_ray(u, v, W, H)
-            dists = []
-            for (x, y, z) in pts_cam:
-                # Direction angles of point from camera
-                pyaw = math.atan2(y, x)
-                horiz = math.hypot(x, y)
-                ppitch = math.atan2(z, max(horiz, 1e-6))
-                if self._ang_diff(pyaw, yaw) <= win_yaw and abs(ppitch - pitch) <= win_pitch:
-                    dists.append(math.sqrt(x * x + y * y + z * z))
-            if dists:
-                dist = float(np.median(dists))
-            else:
+            if pts_cam is None:
+                # No TF -> no depth available
                 dist = float('nan')
+            else:
+                yaw, pitch = self._equirect_ray(u, v, W, H)
+                dists = []
+                for (x, y, z) in pts_cam:
+                    # Direction angles of point from camera
+                    pyaw = math.atan2(y, x)
+                    horiz = math.hypot(x, y)
+                    ppitch = math.atan2(z, max(horiz, 1e-6))
+                    if self._ang_diff(pyaw, yaw) <= win_yaw and abs(ppitch - pitch) <= win_pitch:
+                        dists.append(math.sqrt(x * x + y * y + z * z))
+                dist = float(np.median(dists)) if dists else float('nan')
             results.append((label, u, v, dist))
 
         # Append to object_list.txt
@@ -275,6 +280,8 @@ class PairedDetectAndDepth:
             with open(self.object_list_path, 'a') as f:
                 for (label, u, v, dist) in results:
                     f.write(f"{stamp.to_sec():.3f}\t{label}\t{u:.1f}\t{v:.1f}\t{dist if not math.isnan(dist) else -1}\n")
+                f.flush()
+                os.fsync(f.fileno())
             rospy.loginfo('paired_detect_and_depth: wrote %d detections to %s', len(results), self.object_list_path)
         except Exception as e:
             rospy.logwarn('Failed writing object list: %s', str(e))

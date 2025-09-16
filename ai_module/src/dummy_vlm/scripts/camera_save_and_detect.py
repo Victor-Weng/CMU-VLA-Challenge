@@ -52,6 +52,11 @@ class CameraSaveAndDetect:
         self.model = rospy.get_param('~model', 'yolov8n.pt')
         self.save_path_param = rospy.get_param('~save_path', '')  # if provided, overrides default path
         self.extra_compat_writes = bool(rospy.get_param('~extra_compat_writes', True))
+        # New: sequential saving and cleanup
+        self.sequential_saves = bool(rospy.get_param('~sequential_saves', True))
+        self.image_dir_param = rospy.get_param('~image_dir', '')
+        self.image_prefix = rospy.get_param('~image_prefix', 'image_')
+        self.cleanup_images_on_startup = bool(rospy.get_param('~cleanup_images_on_startup', True))
 
         # Compute save path to match object_detection.py's default
         # object_detection.py lives in <pkg_dir>/src/object_detection.py
@@ -62,6 +67,13 @@ class CameraSaveAndDetect:
         data_dir = os.path.join(project_root, 'data')
         default_save_path = os.path.join(data_dir, 'image.png')
         self.save_path = self.save_path_param if self.save_path_param else default_save_path
+        # Resolve sequential image directory and extension
+        self.image_ext = os.path.splitext(self.save_path)[1].lower() or '.png'
+        if self.image_dir_param:
+            self.image_dir = self.image_dir_param
+        else:
+            # Use directory of save_path as default
+            self.image_dir = os.path.dirname(self.save_path)
         self.detector_script = os.path.join(objdet_dir, 'object_detection.py')
 
         # Also compute alternate save paths for compatibility, if enabled
@@ -73,9 +85,9 @@ class CameraSaveAndDetect:
         self.alt2_data_dir = alt_src_data_dir
         self.alt2_save_path = os.path.join(alt_src_data_dir, os.path.basename(self.save_path) or 'image.png')
 
-        # Ensure data dir exists
+        # Ensure output dirs exist
         try:
-            os.makedirs(data_dir)
+            os.makedirs(self.image_dir)
         except OSError as e:
             if e.errno != errno.EEXIST:
                 raise
@@ -84,10 +96,19 @@ class CameraSaveAndDetect:
         self.last_save_time = rospy.Time(0)
         self.last_rx_time = rospy.Time(0)
 
+        # Optional cleanup on startup
+        if self.cleanup_images_on_startup and self.sequential_saves:
+            self._cleanup_images()
+        # Initialize sequential counter
+        self._init_seq_counter()
+
         self.sub = rospy.Subscriber(self.image_topic, Image, self.image_cb, queue_size=1, buff_size=2**24)
         rospy.loginfo('camera_save_and_detect: listening to %s', self.image_topic)
         rospy.loginfo('camera_save_and_detect: interval = %.2fs, model = %s', self.interval_sec, self.model)
-        rospy.loginfo('camera_save_and_detect: primary save path = %s', self.save_path)
+        if self.sequential_saves:
+            rospy.loginfo('camera_save_and_detect: sequential saving to dir=%s prefix=%s ext=%s (start index=%d)', self.image_dir, self.image_prefix, self.image_ext, getattr(self, 'seq_index', 1))
+        else:
+            rospy.loginfo('camera_save_and_detect: primary save path = %s', self.save_path)
         if self.extra_compat_writes:
             rospy.loginfo('camera_save_and_detect: compat save paths = %s, %s', self.alt_save_path, self.alt2_save_path)
 
@@ -133,25 +154,32 @@ class CameraSaveAndDetect:
 
         # Save as JPEG
         # Decide format based on extension
-        _, ext = os.path.splitext(self.save_path.lower())
+        # Determine output path
+        if self.sequential_saves:
+            out_path = self._next_image_path()
+        else:
+            out_path = self.save_path
+        _, ext = os.path.splitext(out_path.lower())
         try:
             if ext == '.png':
-                ok = cv2.imwrite(self.save_path, cv_img, [int(cv2.IMWRITE_PNG_COMPRESSION), 3])
+                ok = cv2.imwrite(out_path, cv_img, [int(cv2.IMWRITE_PNG_COMPRESSION), 3])
             else:
-                ok = cv2.imwrite(self.save_path, cv_img, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+                ok = cv2.imwrite(out_path, cv_img, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
             if not ok:
-                rospy.logwarn('Failed to write image to %s', self.save_path)
+                rospy.logwarn('Failed to write image to %s', out_path)
                 return
             # Best-effort write to alternate locations if enabled
             if self.extra_compat_writes:
                 try:
                     os.makedirs(self.alt_data_dir, exist_ok=True)
-                    cv2.imwrite(self.alt_save_path, cv_img)
+                    alt_out = os.path.join(self.alt_data_dir, os.path.basename(out_path))
+                    cv2.imwrite(alt_out, cv_img)
                 except Exception:
                     pass
                 try:
                     os.makedirs(self.alt2_data_dir, exist_ok=True)
-                    cv2.imwrite(self.alt2_save_path, cv_img)
+                    alt2_out = os.path.join(self.alt2_data_dir, os.path.basename(out_path))
+                    cv2.imwrite(alt2_out, cv_img)
                 except Exception:
                     pass
         except Exception as e:
@@ -160,13 +188,13 @@ class CameraSaveAndDetect:
 
         self.last_save_time = now
         if self.extra_compat_writes:
-            rospy.loginfo('Saved image to %s (compat: %s, %s); running detector...', self.save_path, self.alt_save_path, self.alt2_save_path)
+            rospy.loginfo('Saved image to %s (compat dirs mirrored); running detector...', out_path)
         else:
-            rospy.loginfo('Saved image to %s; running detector...', self.save_path)
+            rospy.loginfo('Saved image to %s; running detector...', out_path)
 
         # Run detector as a subprocess
         py = sys.executable or 'python3'
-        cmd = [py, self.detector_script, self.save_path, '--model', self.model]
+    cmd = [py, self.detector_script, out_path, '--model', self.model]
         rospy.loginfo('Running detector command: %s', ' '.join(cmd))
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
@@ -189,6 +217,42 @@ if __name__ == '__main__':
     main()
 
 # ---------- Helpers ----------
+    def _init_seq_counter(self):
+        # Determine next index based on existing files
+        if not self.sequential_saves:
+            self.seq_index = 1
+            return
+        try:
+            files = os.listdir(self.image_dir)
+        except Exception:
+            files = []
+        max_idx = 0
+        pref = self.image_prefix
+        for name in files:
+            if not name.startswith(pref) or not name.endswith(self.image_ext):
+                continue
+            num = name[len(pref):-len(self.image_ext)] if len(self.image_ext) > 0 else name[len(pref):]
+            if num.isdigit():
+                max_idx = max(max_idx, int(num))
+        self.seq_index = max_idx + 1
+
+    def _next_image_path(self):
+        name = f"{self.image_prefix}{self.seq_index:06d}{self.image_ext}"
+        self.seq_index += 1
+        return os.path.join(self.image_dir, name)
+
+    def _cleanup_images(self):
+        try:
+            files = os.listdir(self.image_dir)
+        except Exception:
+            return
+        pref = self.image_prefix
+        for name in files:
+            if name.startswith(pref) and name.endswith(self.image_ext):
+                try:
+                    os.remove(os.path.join(self.image_dir, name))
+                except Exception:
+                    pass
 def _bytes_to_array(msg, channels):
     # Handle row stride (step) potentially > width*channels
     width = msg.width

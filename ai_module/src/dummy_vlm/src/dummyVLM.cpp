@@ -225,8 +225,8 @@ void readObjectListFile()
   FILE *object_list_file = fopen(object_list_file_dir.c_str(), "r");
   if (object_list_file == NULL)
   {
-    printf("\nCannot read input files, exit.\n\n");
-    exit(1);
+    printf("\n[WARNING] dummyVLM: object_list file '%s' not found; skipping read.\n\n", object_list_file_dir.c_str());
+    return;
   }
 
   char s[100], s2[100];
@@ -243,7 +243,9 @@ void readObjectListFile()
 
   if (val1 != 1 || val2 != 1 || val3 != 1 || val4 != 1 || val5 != 1 || val6 != 1 || val7 != 1 || val8 != 1 || val9 != 1)
   {
-    exit(1);
+    printf("\n[WARNING] dummyVLM: object_list file '%s' is malformed or empty; skipping read.\n\n", object_list_file_dir.c_str());
+    fclose(object_list_file);
+    return;
   }
 
   while (s[strlen(s) - 1] != '"')
