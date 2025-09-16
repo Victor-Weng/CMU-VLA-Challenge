@@ -104,8 +104,8 @@ class PairedDetectAndDepth:
         self.wait_for_question = bool(rospy.get_param('~wait_for_question', True))
         self.question_topic = rospy.get_param('~question_topic', '/challenge_question')
         self.activated = not self.wait_for_question
-    # Shutdown behavior: stop this node once a final answer is published
-    self.shutdown_on_final_answer = bool(rospy.get_param('~shutdown_on_final_answer', True))
+        # Shutdown behavior: stop this node once a final answer is published
+        self.shutdown_on_final_answer = bool(rospy.get_param('~shutdown_on_final_answer', True))
         # Deduplication settings
         self.dedup_enabled = bool(rospy.get_param('~dedup_enabled', True))
         self.dedup_radius_m = float(rospy.get_param('~dedup_radius_m', 0.5))
