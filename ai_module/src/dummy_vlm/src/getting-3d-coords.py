@@ -5,8 +5,8 @@ import os
 import sys
 from collections import defaultdict
 
-# Dedup threshold (in same units as computed positions). Default 100; override via env DEDUP_DISTANCE
-DEDUP_DISTANCE = float(os.getenv("DEDUP_DISTANCE", "100.0"))
+# Dedup threshold (in same units as computed positions). Default 30; override via env DEDUP_DISTANCE
+DEDUP_DISTANCE = float(os.getenv("DEDUP_DISTANCE", "30.0"))
 
 # Resolve package paths relative to this file regardless of current working directory
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -144,7 +144,7 @@ with open(input_file, "r") as f_in, open(output_file, "w") as f_out:
             continue
 
         kept_by_label[label].append(pos_3d)
-        f_out.write(f"{timestamp} {label} {pos_3d[0]:.3f} {pos_3d[1]:.3f} {pos_3d[2]:.3f}\n")
+        f_out.write(f"{label} {pos_3d[0]:.3f} {pos_3d[1]:.3f} {pos_3d[2]:.3f}\n")
         total_out += 1
 
 print(f"Updated object list saved to {output_file}")

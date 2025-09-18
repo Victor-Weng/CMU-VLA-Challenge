@@ -154,13 +154,18 @@ static ros::Time g_goHomeStepDeadline;     // current step deadline
 // Track whether we've run frontier at least once in this session
 static bool g_frontierWasRun = false;
 static double g_frontierWarmupSec = 300.0; // default warmup duration before answering
-static bool g_shutdownAfterAnswer = true;  // stop node after answering by default
+static double g_mistralDelay = 20.0;
+static bool g_shutdownAfterAnswer = false; // stop node after answering by default
 // Optional API key provided via ROS param (fallback if env not set)
-static std::string g_mistralApiKey;
+static std::string g_mistralApiKey = "m1hdTXLDZrNskFQbKjpupHd3ClRnZXAY";
 // Clear detection log at first question if frontier has not run yet
 static bool g_clearDetectOnFreshSession = true;
 static std::string g_detectClearService = "/paired_detect_and_depth/clear_object_list";
 static bool g_hasObjectInfo = false; // whether structured object info was loaded
+// When enabled, suppress all navigation and frontier bridging but keep answering questions
+static bool g_qaOnlyMode = false;
+// True while we're in the timed frontier warmup window; keeps bridging active
+static bool g_inWarmup = false;
 
 // Helper: record (and de-dup) waypoint events
 static inline void recordWaypoint(const geometry_msgs::Pose2D &wp)
@@ -191,8 +196,8 @@ void pubPathWaypoints(ros::Publisher &waypointPub, geometry_msgs::Pose2D &waypoi
 // frontier bridge callback implementation
 void nextGoalCb(const geometry_msgs::PoseStamped::ConstPtr &msg)
 {
-  // Only bridge when explicitly enabled by user command (prevents conflicts with manual nav)
-  if (!g_frontierEnabled)
+  // Only bridge when explicitly enabled, or during warmup; always suppressed in QA-only mode
+  if ((!g_frontierEnabled && !g_inWarmup) || g_qaOnlyMode)
     return;
 
   // Suppress bridging if a recovery just triggered and we want to hold the turn-in-place
@@ -462,6 +467,29 @@ std::string askMistral(const std::string &question)
   }
 }
 
+// Retry helper: keep calling askMistral until non-empty response or timeout
+static std::string askMistralWithRetry(const std::string &q, double maxWaitSec = 120.0, double retryDelaySec = 12.0)
+{
+  ros::Time start = ros::Time::now();
+  std::string out;
+  int attempt = 0;
+  while (ros::ok() && (ros::Time::now() - start).toSec() < maxWaitSec)
+  {
+    attempt++;
+    out = askMistral(q);
+    if (!out.empty())
+    {
+      if (attempt > 1)
+        ROS_INFO("Mistral succeeded on attempt %d", attempt);
+      return out;
+    }
+    ROS_WARN("Mistral attempt %d failed; retrying in %.1fs (%.0fs left)", attempt, retryDelaySec,
+             std::max(0.0, maxWaitSec - (ros::Time::now() - start).toSec()));
+    ros::Duration(retryDelaySec).sleep();
+  }
+  return out; // may be empty if timed out
+}
+
 // handle navigator commands (to be replaced by LLM later)
 // Parse and execute simple nav commands
 //   1) "goto x y [theta]"  -> publish a single waypoint to (x, y) with optional theta
@@ -509,8 +537,15 @@ bool handleNavCommand(const std::string &q, ros::Publisher &waypointPub, geometr
     }
     else if (arg == "stop")
     {
-      g_frontierEnabled = false;
-      ROS_INFO("Frontier exploration DISABLED");
+      if (g_inWarmup)
+      {
+        ROS_WARN("Frontier stop ignored during warmup window");
+      }
+      else
+      {
+        g_frontierEnabled = false;
+        ROS_INFO("Frontier exploration DISABLED");
+      }
     }
     else
     {
@@ -643,8 +678,8 @@ bool handleNavCommand(const std::string &q, ros::Publisher &waypointPub, geometr
 
   // Mistral API
   // Print the mistral api output with ROS-INFO
-
-  std::string mistralOutput = askMistral(s);
+  ros::Duration(1.5).sleep();
+  std::string mistralOutput = askMistralWithRetry(s, 120.0, 3.0);
   if (!mistralOutput.empty())
   {
     ROS_INFO("Mistral says: %s", mistralOutput.c_str());
@@ -810,6 +845,13 @@ void questionHandler(const std_msgs::String::ConstPtr &msg)
 // Periodic diagnostics: prints status about frontier bridging and required topics/TF
 void diagnosticsTimerCb(const ros::TimerEvent &)
 {
+  // In QA-only mode, suppress all autonomous navigation/recovery behavior
+  if (g_qaOnlyMode)
+  {
+    ROS_INFO_THROTTLE(5.0, "QA-only mode: diagnostics running, navigation suppressed");
+    return;
+  }
+
   if (!g_frontierEnabled)
   {
     // We still run stagnation recovery even if frontier is off when navigation is active.
@@ -1069,7 +1111,7 @@ int main(int argc, char **argv)
   nhPrivate.param("frontier_warmup_sec", g_frontierWarmupSec, g_frontierWarmupSec);
   nhPrivate.param("shutdown_after_answer", g_shutdownAfterAnswer, g_shutdownAfterAnswer);
   // Optional: Mistral API key via ROS param as fallback to environment
-  nhPrivate.param<std::string>("mistral_api_key", g_mistralApiKey, std::string("r0zUJ6urp8Ae2wrCsoA32lfyyTR3pi3R"));
+  nhPrivate.param<std::string>("mistral_api_key", g_mistralApiKey, std::string("m1hdTXLDZrNskFQbKjpupHd3ClRnZXAY"));
   nhPrivate.param("clear_detect_on_fresh_session", g_clearDetectOnFreshSession, g_clearDetectOnFreshSession);
   nhPrivate.param("detect_clear_service", g_detectClearService, g_detectClearService);
 
@@ -1151,15 +1193,23 @@ int main(int argc, char **argv)
         }
       }
       ROS_INFO("Frontier has not been run yet; running for %.0f seconds before answering.", g_frontierWarmupSec);
+      g_inWarmup = true;
       g_frontierEnabled = true;
       ros::Time start = ros::Time::now();
       ros::Duration horizon(g_frontierWarmupSec);
       while (ros::ok() && (ros::Time::now() - start) < horizon)
       {
+        // ensure bridging stays enabled during warmup
+        if (!g_frontierEnabled)
+        {
+          ROS_WARN_THROTTLE(5.0, "Warmup: frontier bridging was disabled; re-enabling");
+          g_frontierEnabled = true;
+        }
         ros::spinOnce();
         rate.sleep();
       }
       g_frontierEnabled = false;
+      g_inWarmup = false;
       g_frontierWasRun = true;
       ROS_INFO("Frontier run complete; proceeding to answer.");
     }
@@ -1193,7 +1243,7 @@ int main(int argc, char **argv)
     // Call Mistral with the question text (log timing and publish raw output)
     ROS_INFO("Calling Mistral for question (%zu chars)...", question.size());
     ros::Time t0 = ros::Time::now();
-    std::string mistralOut = askMistral(question);
+    std::string mistralOut = askMistralWithRetry(question, 120.0, 3.0);
     double dt = (ros::Time::now() - t0).toSec();
     if (!mistralOut.empty())
     {
@@ -1239,7 +1289,14 @@ int main(int argc, char **argv)
       {
         delObjectMarker(objectMarkerPub, objectMarkerMsgs); // clear any previous
         pubObjectMarker(objectMarkerPub, objectMarkerMsgs);
-        pubObjectWaypoint(waypointPub, waypointMsgs);
+        if (!g_qaOnlyMode)
+        {
+          pubObjectWaypoint(waypointPub, waypointMsgs);
+        }
+        else
+        {
+          ROS_INFO("QA-only mode: suppressing navigation to object");
+        }
       }
       else
       {
@@ -1249,7 +1306,14 @@ int main(int argc, char **argv)
     else
     {
       // Instruction-following (default): send path/waypoints
-      pubPathWaypoints(waypointPub, waypointMsgs, rate);
+      if (!g_qaOnlyMode)
+      {
+        pubPathWaypoints(waypointPub, waypointMsgs, rate);
+      }
+      else
+      {
+        ROS_INFO("QA-only mode: suppressing default waypoint navigation");
+      }
     }
 
     // Print the required JSON schema for documentation/logging
@@ -1295,7 +1359,22 @@ int main(int argc, char **argv)
     }
     // Ensure frontier bridging is disabled after handling
     g_frontierEnabled = false;
-    if (g_shutdownAfterAnswer)
+    // Enter QA-only mode to keep node alive but stop robot movement
+    g_qaOnlyMode = true;
+    g_cancelNav = true;
+
+    if (!g_qaOnlyMode)
+    {
+      ros::Time start = ros::Time::now();
+      ros::Duration horizon(g_mistralDelay);
+      while (ros::ok() && (ros::Time::now() - start) < horizon)
+      {
+        ros::spinOnce();
+        rate.sleep();
+      }
+    }
+
+    if (g_shutdownAfterAnswer && !g_qaOnlyMode)
     {
       // Give a brief moment for latched publications to flush to subscribers before shutdown
       ros::Duration(0.25).sleep();

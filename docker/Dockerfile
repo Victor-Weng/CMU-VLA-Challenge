@@ -37,8 +37,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   libglib2.0-0 \
   # Networking for Mistral client
   libcurl4 \
-  # C++ JSON library header-only package for <nlohmann/json.hpp>
-  nlohmann-json3-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Optional: pip if we need to install Python packages from requirements later
