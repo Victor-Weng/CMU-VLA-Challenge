@@ -43,12 +43,12 @@ public:
           free_threshold_(20), occ_threshold_(65), min_frontier_cells_(10),
           fallback_enabled_(true), fb_angle_(0.0), fb_radius_(1.0), fb_radius_max_(5.0), fb_angle_step_(M_PI / 6.0), fb_radius_step_(0.2),
           robot_radius_(0.30), safety_margin_(0.20),
-          min_goal_dist_m_(1.0), min_publish_separation_m_(0.5), min_publish_period_s_(1.5),
-          unknown_radius_m_(2.0), weight_unknown_(1.0), weight_distance_(0.2),
+          min_goal_dist_m_(3.0), min_publish_separation_m_(0.5), min_publish_period_s_(3.0),
+          unknown_radius_m_(2.0), weight_unknown_(1.0), weight_distance_(0.6),
           current_goal_active_(false),
           switch_improvement_(5.0), goal_timeout_s_(25.0), progress_window_s_(6.0), min_progress_m_(0.30),
           recent_goal_block_s_(12.0), recent_goal_radius_m_(0.6),
-          random_step_m_(1.0), random_trials_(8), temp_hold_s_(3.0), temp_goal_active_(false)
+          random_step_m_(3.0), random_trials_(8), temp_hold_s_(3.0), temp_goal_active_(false)
     {
         pnh_.param<string>("map_frame", map_frame_, map_frame_);
         pnh_.param<string>("robot_frame", robot_frame_, robot_frame_);

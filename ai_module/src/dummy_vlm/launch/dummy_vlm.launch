@@ -39,7 +39,7 @@
   <arg name="paired_specific_enabled" default="true"/>
   <arg name="paired_specific_cmd_topic" default="/vlm_command"/>
   <arg name="paired_dedup_enabled" default="true"/>
-  <arg name="paired_dedup_radius_m" default="0.5"/>
+  <arg name="paired_dedup_radius_m" default="0.2"/>
   <arg name="paired_dedup_pixel_tol" default="40.0"/>
   <arg name="paired_dedup_dist_tol_m" default="0.5"/>
   <arg name="paired_dedup_lookback" default="1000"/>
@@ -85,7 +85,7 @@
     <param name="home_go_timeout_sec" value="$(arg home_go_timeout_sec)"/>
     <param name="home_push_timeout_sec" value="$(arg home_push_timeout_sec)"/>
     <!-- Ensure the node exits after answering one question -->
-    <param name="frontier_warmup_sec" value="20.0"/>
+    <param name="frontier_warmup_sec" value="120.0"/>
     <param name="shutdown_after_answer" value="true"/>
   </node>
   <!-- Simple converter: /terrain_map (PointCloud2) -> /map (OccupancyGrid) -->
@@ -109,26 +109,26 @@
     <param name="robot_pose_topic" value="$(arg robot_pose_topic)"/>
     <param name="fallback_enabled" value="true"/>
     <param name="fallback_radius_max" value="5.0"/>
-    <param name="robot_radius" value="0.35"/>
-    <param name="safety_margin" value="0.25"/>
+    <param name="robot_radius" value="0.15"/>
+    <param name="safety_margin" value="0.10"/>
     <!-- Frontier tuning -->
     <param name="min_frontier_cells" value="12"/>
     <param name="free_threshold" value="20"/>
     <param name="occ_threshold" value="65"/>
     <!-- Goal selection & hysteresis -->
-    <param name="min_goal_dist" value="1.0"/>
+    <param name="min_goal_dist" value="3.0"/>
     <param name="min_publish_separation" value="0.6"/>
-    <param name="min_publish_period" value="1.5"/>
-    <param name="unknown_radius" value="2.0"/>
-    <param name="weight_unknown" value="1.0"/>
-    <param name="weight_distance" value="0.2"/>
+    <param name="min_publish_period" value="3.0"/>
+    <param name="unknown_radius" value="1.3"/>
+    <param name="weight_unknown" value="0.8"/>
+    <param name="weight_distance" value="1.4"/>
     <!-- Anti-oscillation / commitment tuning -->
-    <param name="switch_improvement" value="5.0"/>
+    <param name="switch_improvement" value="6.0"/>
     <param name="goal_timeout" value="25.0"/>
     <param name="progress_window" value="6.0"/>
-    <param name="min_progress" value="0.30"/>
-    <param name="recent_goal_block_s" value="12.0"/>
-    <param name="recent_goal_radius_m" value="0.6"/>
+    <param name="min_progress" value="1.40"/>
+    <param name="recent_goal_block_s" value="35.0"/>
+    <param name="recent_goal_radius_m" value="1.2"/>
   </node>
 
   <!-- Capture synchronized image+LiDAR pairs with time/distance gating -->
